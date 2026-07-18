@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"image"
 	_ "image/gif"
 	_ "image/jpeg"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,19 +23,41 @@ import (
 )
 
 const (
-	// maxImageWidth and maxImageHeight bound the dimensions that on-the-fly
-	// WebP conversions under /imgs/ are downscaled to.
+	// maxImageWidth and maxImageHeight are the default dimensions on-the-fly
+	// WebP conversions under /imgs/ are downscaled to when a request doesn't
+	// override them via the w/h query params (see parseImageRequestOptions).
 	maxImageWidth  = 512
 	maxImageHeight = 256
-	// webpQuality is the lossy encoding quality used for /imgs/ conversions.
+	// webpQuality is the default lossy encoding quality used for /imgs/
+	// conversions when a request doesn't supply a q query param.
 	webpQuality = 60
+	// minWebPQuality and maxWebPQuality clamp the q query param.
+	minWebPQuality = 30
+	maxWebPQuality = 95
+	// imageCacheTTL bounds how long a converted /imgs/ variant may sit idle
+	// in memory before it's evicted. Every cache hit refreshes an entry's
+	// lastAccessed time, so actively-requested images stay cached
+	// indefinitely; only variants nobody has asked for in imageCacheTTL age
+	// out. This keeps long-running deployments (months of uptime) from
+	// accumulating an unbounded number of cached size/quality variants.
+	imageCacheTTL = 24 * time.Hour
 )
 
+// imageRequestOptions carries the resolved per-request resize/quality
+// settings for one /imgs/ conversion, derived from the w/h/q query params.
+type imageRequestOptions struct {
+	maxWidth  int
+	maxHeight int
+	quality   float32
+}
+
 // cachedWebP holds a previously converted WebP image plus the source file's
-// modification time, used to detect when the cached copy is stale.
+// modification time (used to detect when the cached copy is stale) and the
+// last time it was served (used to evict idle entries, see imageCacheTTL).
 type cachedWebP struct {
-	data    []byte
-	modTime time.Time
+	data         []byte
+	modTime      time.Time
+	lastAccessed time.Time
 }
 
 type webpConversionCache struct {
@@ -48,6 +72,29 @@ func newWebPConversionCache() *webpConversionCache {
 // webpCache backs the legacy handler constructor. Constructed servers use an
 // instance-owned cache so tests and multiple servers remain isolated.
 var webpCache = newWebPConversionCache()
+
+// pruneExpiredImageCache removes cached WebP variants that haven't been
+// served in ttl, reclaiming memory from images nobody is requesting anymore
+// (e.g. removed from the site, or a superseded w/h/q variant). Actively
+// requested entries are untouched because a cache hit refreshes
+// lastAccessed. Run periodically (see run() in main.go) rather than relying
+// solely on the lazy check in optimizedImageHandlerWithCache, since that
+// only evicts an entry when something asks for it again.
+func pruneExpiredImageCache(cache *webpConversionCache, ttl time.Duration) {
+	cache.Lock()
+	defer cache.Unlock()
+	now := time.Now()
+	removed := 0
+	for key, entry := range cache.items {
+		if now.Sub(entry.lastAccessed) > ttl {
+			delete(cache.items, key)
+			removed++
+		}
+	}
+	if removed > 0 {
+		log.Printf("image cache: pruned %d expired entr(ies), %d remaining", removed, len(cache.items))
+	}
+}
 
 // optimizedImageHandler returns an http.HandlerFunc that serves images under
 // staticDir as WebP when the requesting client advertises WebP support via
@@ -95,14 +142,19 @@ func optimizedImageHandlerWithCache(staticDir string, fallback http.Handler, cac
 			return
 		}
 
-		key := fullPath
+		opts := parseImageRequestOptions(r)
+		key := fmt.Sprintf("%s|w=%d|h=%d|q=%0.1f", fullPath, opts.maxWidth, opts.maxHeight, opts.quality)
 
 		cache.RLock()
 		cached, ok := cache.items[key]
 		cache.RUnlock()
 
-		if ok && info.ModTime().Equal(cached.modTime) {
+		if ok && info.ModTime().Equal(cached.modTime) && time.Since(cached.lastAccessed) <= imageCacheTTL {
 			log.Printf("image cache: hit for %s", fullPath)
+			cache.Lock()
+			cached.lastAccessed = time.Now()
+			cache.items[key] = cached
+			cache.Unlock()
 			serveWebP(w, r, fullPath, cached.modTime, cached.data)
 			return
 		}
@@ -133,17 +185,17 @@ func optimizedImageHandlerWithCache(staticDir string, fallback http.Handler, cac
 			return
 		}
 
-		processed := resizeIfNeeded(img)
+		processed := resizeIfNeeded(img, opts.maxWidth, opts.maxHeight)
 
 		var buf bytes.Buffer
-		if err := webp.Encode(&buf, processed, &webp.Options{Quality: webpQuality}); err != nil {
+		if err := webp.Encode(&buf, processed, &webp.Options{Quality: opts.quality}); err != nil {
 			fallback.ServeHTTP(w, r)
 			return
 		}
 
 		data := buf.Bytes()
 		cache.Lock()
-		cache.items[key] = cachedWebP{data: data, modTime: info.ModTime()}
+		cache.items[key] = cachedWebP{data: data, modTime: info.ModTime(), lastAccessed: time.Now()}
 		cache.Unlock()
 		log.Printf("image cache: stored %s (%d bytes)", fullPath, len(data))
 
@@ -170,10 +222,75 @@ func supportsWebP(r *http.Request) bool {
 	return strings.Contains(accept, "image/webp")
 }
 
-// resizeIfNeeded downscales src to fit within the standard /imgs/ bounds
-// (maxImageWidth x maxImageHeight), leaving it untouched if it already fits.
-func resizeIfNeeded(src image.Image) image.Image {
-	return resizeToFit(src, maxImageWidth, maxImageHeight)
+// parseImageRequestOptions resolves the w/h/q query params on an /imgs/
+// request into concrete resize/quality settings.
+//
+//   - If neither w nor h is given, both default to maxImageWidth/maxImageHeight.
+//   - If exactly one of w/h is given, the other is left unconstrained (-1)
+//     rather than defaulted, so e.g. "?w=1200" alone scales to exactly
+//     1200px wide at the source aspect ratio instead of being boxed into
+//     the default bounds.
+//   - q defaults to webpQuality and is clamped to [minWebPQuality, maxWebPQuality].
+//
+// Invalid or non-positive values are treated the same as absent ones.
+func parseImageRequestOptions(r *http.Request) imageRequestOptions {
+	maxWidth := parsePositiveInt(r.URL.Query().Get("w"))
+	maxHeight := parsePositiveInt(r.URL.Query().Get("h"))
+	quality := parsePositiveInt(r.URL.Query().Get("q"))
+
+	if maxWidth == 0 && maxHeight == 0 {
+		maxWidth = maxImageWidth
+		maxHeight = maxImageHeight
+	} else {
+		if maxWidth == 0 {
+			maxWidth = -1
+		}
+		if maxHeight == 0 {
+			maxHeight = -1
+		}
+	}
+
+	q := webpQuality
+	if quality > 0 {
+		switch {
+		case quality < minWebPQuality:
+			q = minWebPQuality
+		case quality > maxWebPQuality:
+			q = maxWebPQuality
+		default:
+			q = quality
+		}
+	}
+
+	return imageRequestOptions{maxWidth: maxWidth, maxHeight: maxHeight, quality: float32(q)}
+}
+
+// parsePositiveInt parses raw as a positive int, returning 0 for anything
+// empty, malformed, or non-positive so callers can treat it as "unset".
+func parsePositiveInt(raw string) int {
+	if raw == "" {
+		return 0
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	return value
+}
+
+// resizeIfNeeded downscales src to fit within maxWidth x maxHeight, leaving
+// it untouched if it already fits. A maxWidth or maxHeight below 1 (the
+// sentinel parseImageRequestOptions produces for an unconstrained axis) is
+// resolved to src's own dimension on that axis, i.e. no constraint.
+func resizeIfNeeded(src image.Image, maxWidth, maxHeight int) image.Image {
+	bounds := src.Bounds()
+	if maxWidth < 1 {
+		maxWidth = bounds.Dx()
+	}
+	if maxHeight < 1 {
+		maxHeight = bounds.Dy()
+	}
+	return resizeToFit(src, maxWidth, maxHeight)
 }
 
 // resizeToFit downscales src, preserving aspect ratio, so that it fits

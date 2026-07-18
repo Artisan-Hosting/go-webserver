@@ -4,7 +4,8 @@ A single Go binary that serves a static marketing/portfolio site, plus a
 handful of small dynamic features layered on top:
 
 - **Static file serving** with automatic on-the-fly WebP conversion for
-  images requested under `/imgs/`.
+  images requested under `/imgs/`, optionally resized/re-encoded per request
+  via `w`/`h`/`q` query params (see the endpoint table below).
 - **Server-side link-preview images** — HTML pages under the static site
   get their `<img>` previews fetched, cached, and rewritten server-side.
 - **Contact form** (`/api/contact`) that emails both the submitter and the
@@ -108,6 +109,29 @@ system and how to add a per-site theme.
 | `POST /api/contact` | `contactHandler` | Contact form submission: validates captcha (if enabled), emails submitter + owner. |
 | `GET /api/captcha-config` | `captchaConfigHandler` | Public captcha config (enabled flag + endpoint) for the frontend widget. |
 | `GET /reload` | `reloadHandler` | Server-Sent-Events stream that fires on static file changes, for live reload during local dev. |
+
+### `/imgs/*` resize/quality query params
+
+Requests may override the default WebP conversion bounds with query params;
+converted variants are cached separately per resolved option set:
+
+| Param | Default | Effect |
+|---|---|---|
+| `w` | `512` | Max output width in pixels. If set without `h`, height is left unconstrained (scales to exactly `w` wide at the source aspect ratio). |
+| `h` | `256` | Max output height in pixels. If set without `w`, width is left unconstrained. |
+| `q` | `60` | WebP encoding quality, clamped to `[30, 95]`. |
+
+Images are only ever downscaled, never upscaled — a source already within
+the resolved bounds is served as-is (after WebP conversion). Example:
+`/imgs/servers.jpg?w=1200&h=1600&q=80`.
+
+Converted variants are cached in memory per `(file, w, h, q)` combination.
+Each cache hit refreshes that entry's last-served time, so actively
+requested images stay cached indefinitely; an entry nobody has requested in
+24h (`imageCacheTTL`) is treated as stale on its next request and
+reconverted. A background sweep also runs every 24h to actively evict idle
+entries, so long-running deployments don't accumulate an unbounded number of
+cached size/quality variants over months of uptime.
 
 ## Adding this to a project
 

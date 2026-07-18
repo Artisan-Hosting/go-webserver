@@ -92,6 +92,7 @@ func run(ctx context.Context, args []string) error {
 
 	// Serve static files
 	hub := newReloadHub()
+	imageCache := newWebPConversionCache()
 	handler := newServerHandler(serverConfig{
 		staticDir:       staticDir,
 		previewCacheDir: previewCacheDir,
@@ -99,6 +100,7 @@ func run(ctx context.Context, args []string) error {
 		buildHash:       currentBuildHash,
 		hub:             hub,
 		previewState:    previews,
+		imageCache:      imageCache,
 	}, serverDependencies{})
 	addr := fmt.Sprintf("0.0.0.0:%d", *port)
 	listener, err := net.Listen("tcp", addr)
@@ -121,6 +123,7 @@ func run(ctx context.Context, args []string) error {
 			select {
 			case <-ticker.C:
 				purgeExpiredPreviewFiles(previewCacheDir, previewTTL)
+				pruneExpiredImageCache(imageCache, imageCacheTTL)
 			case <-ctx.Done():
 				return
 			}
