@@ -1,34 +1,41 @@
 /*
- * Default (generic) email theme.
+ * Artisan Studios email theme.
+ *
+ * Colors and font stack are pulled from the site's design tokens in
+ * static/css/base.css (--navy, --paper, --charcoal, --border, --font-sans,
+ * etc. — light-mode values only, since email clients don't honor the
+ * site's dark-mode toggle). Custom fonts are declared with the site's
+ * fallback stack but not @import-ed here: most email clients strip
+ * external font loading, so this degrades straight to the system fallbacks.
  *
  * This file only sets appearance — colors, fonts, spacing. It must not
  * introduce new selectors beyond the ones documented in
- * server/MAIL_THEMING.md, since the HTML structure in server/mailtheme.go
+ * docs/MAIL_THEMING.md, since the HTML structure in mailtheme.go
  * is fixed and only styles the classes below.
  *
  * To brand this for a specific site deployment, copy this file, change the
- * values, and point MAIL_THEME_CSS at the copy — see server/MAIL_THEMING.md.
+ * values, and point MAIL_THEME_CSS at the copy — see docs/MAIL_THEMING.md.
  */
 
 body, html {
-  background: #f4f5f7;
-  color: #24292f;
-  font-family: Arial, Helvetica, sans-serif;
+  background: #f6f7fb;
+  color: #1f2430;
+  font-family: 'Source Sans 3', system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
 }
 
 a {
-  color: #2451b8;
+  color: #0b132b;
 }
 
 .email-wrap {
-  background: #f4f5f7;
+  background: #f6f7fb;
 }
 
 .email-masthead {
   padding: 24px 0 8px;
   font-size: 16px;
   font-weight: 700;
-  color: #24292f;
+  color: #1f2430;
 }
 
 .email-masthead img {
@@ -37,14 +44,14 @@ a {
 
 .email-card {
   background: #ffffff;
-  border: 1px solid #d7dbe0;
-  border-radius: 10px;
+  border: 1px solid #d8dee9;
+  border-radius: 12px;
   overflow: hidden;
 }
 
 .email-brandbar {
   height: 4px;
-  background: #2451b8;
+  background: #0b132b;
 }
 
 .email-content-cell {
@@ -56,14 +63,14 @@ a {
   font-size: 22px;
   font-weight: 700;
   line-height: 1.25;
-  color: #14181f;
+  color: #1f2430;
 }
 
 .email-lead {
   margin: 0 0 14px;
   font-size: 15px;
   line-height: 1.6;
-  color: #24292f;
+  color: #1f2430;
 }
 
 .email-dictionary {
@@ -76,7 +83,7 @@ a {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: .06em;
-  color: #57606a;
+  color: #5e616a;
   white-space: nowrap;
   vertical-align: top;
 }
@@ -85,7 +92,7 @@ a {
   padding: 6px 0;
   font-size: 15px;
   line-height: 1.5;
-  color: #24292f;
+  color: #1f2430;
 }
 
 .email-table {
@@ -94,27 +101,27 @@ a {
 
 .email-table th {
   padding: 8px;
-  border-bottom: 1px solid #d7dbe0;
+  border-bottom: 1px solid #d8dee9;
   font-size: 12px;
   text-transform: uppercase;
   letter-spacing: .06em;
-  color: #57606a;
+  color: #5e616a;
   text-align: left;
 }
 
 .email-table td {
   padding: 10px 8px;
-  border-bottom: 1px solid #edf0f3;
+  border-bottom: 1px solid #eef2f7;
   font-size: 14px;
-  color: #24292f;
+  color: #1f2430;
 }
 
 .email-button {
   display: inline-block;
   padding: 12px 28px;
   border-radius: 6px;
-  background-color: #2451b8;
-  color: #ffffff !important;
+  background-color: #0b132b;
+  color: #f6f7fb !important;
   font-size: 15px;
   font-weight: 700;
   text-align: center;
@@ -123,7 +130,7 @@ a {
 .email-trouble {
   margin: 12px 0 0;
   font-size: 12px;
-  color: #808891;
+  color: #84878d;
   word-break: break-all;
 }
 
@@ -132,11 +139,11 @@ a {
   margin: 8px 0;
   padding: 14px 24px;
   border-radius: 6px;
-  background: #f4f5f7;
-  font-family: Consolas, Monaco, monospace;
+  background: #eef2f7;
+  font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
   font-size: 22px;
   letter-spacing: .2em;
-  color: #24292f;
+  color: #1f2430;
   text-align: center;
 }
 
@@ -144,13 +151,13 @@ a {
   margin: 0 0 14px;
   font-size: 15px;
   line-height: 1.6;
-  color: #24292f;
+  color: #1f2430;
 }
 
 .email-signature {
   margin: 0;
   font-size: 15px;
-  color: #24292f;
+  color: #1f2430;
 }
 
 .email-footer {
@@ -158,5 +165,5 @@ a {
   text-align: center;
   font-size: 12px;
   line-height: 1.6;
-  color: #808891;
+  color: #84878d;
 }
