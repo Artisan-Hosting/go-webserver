@@ -1,6 +1,8 @@
 BIN ?= ./bin
+OUTPUT_BIN := $(abspath $(BIN))
 BUILD_DIR ?= .build/site-server
 SITE_OVERRIDES ?=
+COMMAND_DIR ?= cmd/artisan-webserver
 GO ?= go
 COVERAGE_MIN ?= 70
 COVERAGE_DIR ?= .build/coverage
@@ -11,15 +13,15 @@ COVERAGE_HTML ?= $(COVERAGE_DIR)/coverage.html
 
 ifeq ($(strip $(SITE_OVERRIDES)),)
 build:
-	go build -o $(BIN)
+	$(GO) build -o "$(OUTPUT_BIN)" ./$(COMMAND_DIR)
 else
 build: clean-build
-	mkdir -p "$(BUILD_DIR)"
+	mkdir -p "$(BUILD_DIR)/$(COMMAND_DIR)"
 	cp go.mod go.sum "$(BUILD_DIR)/"
-	cp *.go "$(BUILD_DIR)/"
+	cp "$(COMMAND_DIR)"/*.go "$(BUILD_DIR)/$(COMMAND_DIR)/"
 	cp -R theme "$(BUILD_DIR)/"
-	cp -R "$(SITE_OVERRIDES)"/. "$(BUILD_DIR)/"
-	cd "$(BUILD_DIR)" && go build -o "$(CURDIR)/$(BIN)"
+	cp -R "$(SITE_OVERRIDES)"/. "$(BUILD_DIR)/$(COMMAND_DIR)/"
+	cd "$(BUILD_DIR)" && $(GO) build -o "$(OUTPUT_BIN)" ./$(COMMAND_DIR)
 endif
 
 run: build
@@ -37,7 +39,7 @@ test-race:
 	$(GO) test -race ./...
 
 test-integration:
-	$(GO) test -tags=integration -run '^TestServerProcess$$' .
+	$(GO) test -tags=integration -run '^TestServerProcess$$' ./$(COMMAND_DIR)
 
 test-cover:
 	mkdir -p "$(COVERAGE_DIR)"

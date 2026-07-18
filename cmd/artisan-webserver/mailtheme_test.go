@@ -33,7 +33,7 @@ func TestThemeSwapIsRespectedAtStartup(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=TestThemeSwapIsRespectedAtStartup", "-test.v")
 	cmd.Env = append(os.Environ(),
 		"MAILTHEME_TEST_CHILD=1",
-		"MAIL_THEME_CSS=theme/testdata/alt_theme.css",
+		"MAIL_THEME_CSS=../../theme/testdata/alt_theme.css",
 		"MAIL_PRODUCT_NAME=Acme Co",
 		"MAIL_PRODUCT_LINK=https://acme.example.com",
 	)

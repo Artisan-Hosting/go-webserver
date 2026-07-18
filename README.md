@@ -19,26 +19,23 @@ handful of small dynamic features layered on top:
 
 ```
 .
+├── cmd/
+│   └── artisan-webserver/  # server source and co-located Go tests
 ├── docs/
 │   ├── MAIL_THEMING.md      # transactional email layout/theming reference
 │   └── CAPTCHA_FRONTEND.md  # frontend contact-form + Cap captcha integration reference
-├── makefile              # build/run entry points
-├── main.go               # flag parsing, route wiring, startup
-├── env.go                # .env file loading
-├── captcha.go            # Cap captcha verification for the contact form
-├── mail.go               # outbound mail relay client + theming engine
-├── mailtheme.go          # fixed HTML email skeleton (hermes.Theme)
-├── contact.go            # POST /api/contact handler
-├── email_contract.go     # contact-email customization contract
-├── email_templates.go    # default HTML/plain-text email bodies (Hermes data only)
-├── images.go             # on-the-fly WebP conversion for /imgs/
-├── preview.go            # server-side link-preview fetching/caching
-├── watch.go              # filesystem watching + live-reload SSE
 ├── theme/
-│   └── default.css       # default transactional-email theme
+│   ├── default.css          # default transactional-email theme
+│   └── testdata/            # alternate theme fixture used by tests
+├── makefile                 # build, run, and test entry points
 ├── go.mod / go.sum
 └── bin                   # build output (gitignored, not committed)
 ```
+
+All Go source stays together under [`cmd/artisan-webserver/`](cmd/artisan-webserver/README.md)
+because it is one `package main`. This keeps the submodule root easy to scan
+without introducing another `server/` directory or changing the site override
+contract. The source directory's README groups files by responsibility.
 
 `static/` (the site content served at `/`) and `.env` (per-deployment
 secrets/config) are **not part of this repo** — they're provided by whatever
