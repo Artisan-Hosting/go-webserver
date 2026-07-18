@@ -9,9 +9,11 @@ into a full HTML email.
 
 The system has three layers:
 
-1. **Content** — `email_templates.go`. Each email is a
-   `hermes.Body{}` literal (`Intros`, `Dictionary`, `Table`, `Actions`,
-   `Outros`, ...). No HTML.
+1. **Content** — `email_contract.go` defines the fixed contact-email
+   contract, and `email_templates.go` provides the default Artisan Studios
+   implementation. Each email is still a `hermes.Email{}`/`hermes.Body{}`
+   value (`Intros`, `Dictionary`, `Table`, `Actions`, `Outros`, ...). No
+   HTML.
 2. **Layout** — `mailtheme.go`. One fixed HTML skeleton
    (`siteHTMLTemplate`) that all emails share. This is the only file in the
    project with hand-written HTML/CSS structure, and it should not need to
@@ -21,7 +23,8 @@ The system has three layers:
    pointing `MAIL_THEME_CSS` at a different one) reskins every email with no
    Go changes.
 
-`renderEmail()` in `mail.go` ties these together: it builds one
+`contactHandler` asks `contactEmailTemplates` for the client and owner
+emails, then `renderEmail()` in `mail.go` ties these together: it builds one
 `hermes.Hermes` engine (theme + product info) from environment config the
 first time it's needed, and every `hermes.Email{}` passed to it renders
 through that engine.
@@ -96,6 +99,114 @@ write raw HTML for a new email — if the layout can't express what you need,
 extend `mailtheme.go` (layer 2) instead, once, rather than hand-coding HTML
 in the email function.
 
+## Customize contact emails per site
+
+The shared contact-form pipeline owns validation, captcha checks, message
+defaults, rendering, and relay delivery. Site builds customize only the fixed
+email contract:
+
+```go
+type ContactEmail struct {
+	Destination string
+	Subject     string
+	Email       hermes.Email
+}
+
+type ContactEmailTemplates interface {
+	ClientEmail(data FormData) ContactEmail
+	OwnerEmail(data FormData, ownerDestination string) ContactEmail
+}
+```
+
+For a site-specific build, keep this repo clean as a submodule and put the
+site's replacement file in the parent repo, for example:
+
+```text
+client-site/
+├── server/                  # this repo as a submodule
+├── server_overrides/
+│   └── email_templates.go   # package main, site-specific copy
+└── static/
+```
+
+The override file should define `contactEmailTemplates` and return Hermes
+data, not raw HTML:
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/matcornic/hermes"
+)
+
+var contactEmailTemplates ContactEmailTemplates = siteContactEmailTemplates{}
+
+type siteContactEmailTemplates struct{}
+
+func (siteContactEmailTemplates) ClientEmail(data FormData) ContactEmail {
+	name := strings.TrimSpace(data.Name)
+	if name == "" {
+		name = "there"
+	}
+
+	return ContactEmail{
+		Destination: strings.TrimSpace(data.Email),
+		Subject:     "Example Co: We received your message",
+		Email: hermes.Email{
+			Body: hermes.Body{
+				Title: fmt.Sprintf("Thanks, %s.", name),
+				Intros: []string{
+					"We received your message and will reply shortly.",
+				},
+				Actions: []hermes.Action{
+					{
+						Instructions: "In the meantime, you can review our services here:",
+						Button: hermes.Button{
+							Text: "View Services",
+							Link: "https://example.com/services",
+						},
+					},
+				},
+				Outros: []string{
+					"You can reply directly to this email any time.",
+				},
+			},
+		},
+	}
+}
+
+func (siteContactEmailTemplates) OwnerEmail(data FormData, ownerDestination string) ContactEmail {
+	return ContactEmail{
+		Destination: ownerDestination,
+		Subject:     fmt.Sprintf("Example Co: New message from %s", strings.TrimSpace(data.Name)),
+		Email: hermes.Email{
+			Body: hermes.Body{
+				Title: "New website enquiry",
+				Dictionary: []hermes.Entry{
+					{Key: "Name", Value: strings.TrimSpace(data.Name)},
+					{Key: "Email", Value: strings.TrimSpace(data.Email)},
+					{Key: "Message", Value: strings.TrimSpace(data.OwnerMessage)},
+				},
+			},
+		},
+	}
+}
+```
+
+Build with the override directory from the submodule:
+
+```sh
+make -C server build SITE_OVERRIDES=../server_overrides
+```
+
+The make target copies the shared source into `.build/site-server`, overlays
+`SITE_OVERRIDES`, and builds from that disposable directory. This keeps the
+submodule tree clean for CI while letting the site replace
+`email_templates.go`.
+
 ## For AI assistants
 
 If asked to **add or reskin a theme**: read `mailtheme.go` first (the
@@ -107,10 +218,12 @@ contract table — if a new visual element is genuinely needed, that's a
 `mailtheme.go` change (affects every theme), call it out explicitly rather
 than smuggling it into one theme's CSS.
 
-If asked to **add a new email**: add a `hermes.Body{}`-returning function in
-`email_templates.go` (or a new file, package `main`), call
-`renderEmail()`, and wire it into whatever handler needs it — no HTML.
+If asked to **customize contact email copy/links/CTAs for a site**: add or
+edit a site-owned override file outside this repo, usually
+`server_overrides/email_templates.go`, implementing `ContactEmailTemplates`.
+Do not edit the submodule directly unless the default templates for every
+site should change.
 
-If asked to **change email copy/wording**: that's plain string literals in
-`email_templates.go`'s `hermes.Body{}` fields — not a theme or layout
-change.
+If asked to **change the default email copy/wording for all sites**: that's
+plain string literals in this repo's `email_templates.go` Hermes data — not
+a theme or layout change.

@@ -125,20 +125,44 @@ func contactHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Email to the user who submitted the form
 	if data.Email != "" {
+		clientEmail := contactEmailTemplates.ClientEmail(data)
 		sendMail(EmailPayload{
-			Destination: data.Email,
-			Subject:     "Artisan Studios: We received your consult request",
-			Body:        buildClientEmail(data),
+			Destination: clientEmail.Destination,
+			Subject:     clientEmail.Subject,
+			Body:        renderEmail(clientEmail.Email),
 		})
 	}
 
 	// Email to the business owner
+	ownerEmail := contactEmailTemplates.OwnerEmail(data, ownerDestination)
 	sendMail(EmailPayload{
-		Destination: ownerDestination,
-		Subject:     fmt.Sprintf("Artisan Studios: New consult request from %s", data.Name),
-		Body:        buildOwnerEmail(data),
+		Destination: ownerEmail.Destination,
+		Subject:     ownerEmail.Subject,
+		Body:        renderEmail(ownerEmail.Email),
 	})
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"status":"ok"}`))
+}
+
+// buildOwnerMessage assembles a plain-text fallback message for the business
+// owner's notification email when the client did not supply a pre-rendered
+// OwnerMessage. It lists the submitter's contact details followed by their
+// project message.
+func buildOwnerMessage(data FormData) string {
+	parts := make([]string, 0, 6)
+	parts = append(parts, fmt.Sprintf("Name: %s", strings.TrimSpace(data.Name)))
+	parts = append(parts, fmt.Sprintf("Email: %s", strings.TrimSpace(data.Email)))
+
+	if business := strings.TrimSpace(data.Business); business != "" {
+		parts = append(parts, fmt.Sprintf("Business/Brand: %s", business))
+	}
+	if siteURL := strings.TrimSpace(data.SiteURL); siteURL != "" {
+		parts = append(parts, fmt.Sprintf("Current Site URL: %s", siteURL))
+	}
+
+	parts = append(parts, "")
+	parts = append(parts, "Project details:")
+	parts = append(parts, strings.TrimSpace(data.ClientMessage))
+	return strings.Join(parts, "\n")
 }

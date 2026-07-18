@@ -1,5 +1,6 @@
 # Build output (see makefile: `go build -o ./bin`)
 /bin
+/.build
 
 # Per-deployment secrets/config — never commit a real one, see README.md
 /.env

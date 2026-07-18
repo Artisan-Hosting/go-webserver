@@ -29,7 +29,8 @@ handful of small dynamic features layered on top:
 ├── mail.go               # outbound mail relay client + theming engine
 ├── mailtheme.go          # fixed HTML email skeleton (hermes.Theme)
 ├── contact.go            # POST /api/contact handler
-├── email_templates.go    # HTML/plain-text email bodies (data only)
+├── email_contract.go     # contact-email customization contract
+├── email_templates.go    # default HTML/plain-text email bodies (Hermes data only)
 ├── images.go             # on-the-fly WebP conversion for /imgs/
 ├── preview.go            # server-side link-preview fetching/caching
 ├── watch.go              # filesystem watching + live-reload SSE
@@ -114,26 +115,33 @@ system and how to add a per-site theme.
 ## Adding this to a project
 
 This repo is the shared server engine (module path
-`github.com/Artisan-Hosting/go-webserver`). There are two ways to pull it
-into a site:
+`github.com/Artisan-Hosting/go-webserver`). Add it to each site as a git
+submodule, conventionally mounted at `server/`, then build that submodule.
 
-**New projects — `go install`, no source checkout.** Since `-website-files`
-and `-env-path` let a single installed binary point at any site's
-`static/`/`.env`, you generally don't need to vendor the source at all:
+Sites that need custom contact email subjects, copy, links, or CTAs should
+keep the shared submodule clean and place overrides in the parent repo:
 
-```sh
-go install github.com/Artisan-Hosting/go-webserver@latest
+```text
+client-site/
+├── server/                  # this repo as a submodule
+├── server_overrides/
+│   └── email_templates.go   # package main, site-specific Hermes templates
+└── static/
 ```
 
-This installs a binary named `go-webserver` into `$(go env GOPATH)/bin`.
-Run it from the site's root (so `static`/`.env` resolve normally), or pass
-`-website-files`/`-env-path` explicitly to point it elsewhere. Pin a
-released tag (`@v0.1.0`, etc.) instead of `@latest` once this repo starts
-tagging releases, for reproducible deploys.
+Build with:
 
-**Existing projects that vendor the source** — add this repo as a git
-submodule (conventionally mounted at `server/`), then build with
-`make build`.
+```sh
+make -C server build SITE_OVERRIDES=../server_overrides
+```
+
+The build copies this repo into `server/.build/site-server`, overlays the
+override directory, and compiles from that disposable tree. If
+`server_overrides/email_templates.go` exists, it replaces the default
+`email_templates.go` for that build without dirtying the submodule.
+
+See [`docs/MAIL_THEMING.md`](docs/MAIL_THEMING.md#customize-contact-emails-per-site)
+for the `ContactEmailTemplates` contract and an example override.
 
 ## Deployment
 
@@ -141,9 +149,10 @@ This repo is the shared server engine. A deployed site typically looks like:
 
 ```
 /var/www/<site>/
-├── server/       # this repo, checked out here
-├── static/       # the site's own static content
-└── server/.env   # the site's own secrets/config (see Environment variables above)
+├── server/              # this repo, checked out here
+├── server_overrides/    # optional site-owned Go overrides
+├── static/              # the site's own static content
+└── server/.env          # the site's own secrets/config (see Environment variables above)
 ```
 
 Example systemd unit:
@@ -159,7 +168,7 @@ Type=simple
 User=www-data
 Group=www-data
 WorkingDirectory=/var/www/<site>
-ExecStartPre=/usr/bin/make -C /var/www/<site> build
+ExecStartPre=/usr/bin/make -C /var/www/<site>/server build SITE_OVERRIDES=../server_overrides
 ExecStart=/var/www/<site>/server/bin -port 4000
 Restart=on-failure
 RestartSec=5s
