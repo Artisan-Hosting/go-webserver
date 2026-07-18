@@ -59,10 +59,12 @@ func watchFiles(path string, onChange func()) {
 	for {
 		select {
 		case event := <-watcher.Events:
-			log.Println("File change detected:", event.Name)
+			log.Println("watch: file change detected:", event.Name)
 			if onChange != nil {
 				onChange()
+				log.Println("watch: site assets refreshed")
 			}
+			log.Printf("watch: notifying %d connected reload client(s)", len(clients))
 			for ch := range clients {
 				ch <- true
 			}

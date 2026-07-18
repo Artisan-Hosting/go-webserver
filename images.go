@@ -7,6 +7,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"os"
@@ -91,9 +92,12 @@ func optimizedImageHandler(staticDir string, fallback http.Handler) http.Handler
 		webpCache.RUnlock()
 
 		if ok && info.ModTime().Equal(cached.modTime) {
+			log.Printf("image cache: hit for %s", fullPath)
 			serveWebP(w, r, fullPath, cached.modTime, cached.data)
 			return
 		}
+
+		log.Printf("image cache: miss for %s, converting to webp", fullPath)
 
 		file, err := os.Open(fullPath)
 		if err != nil {
@@ -131,6 +135,7 @@ func optimizedImageHandler(staticDir string, fallback http.Handler) http.Handler
 		webpCache.Lock()
 		webpCache.items[key] = cachedWebP{data: data, modTime: info.ModTime()}
 		webpCache.Unlock()
+		log.Printf("image cache: stored %s (%d bytes)", fullPath, len(data))
 
 		serveWebP(w, r, fullPath, info.ModTime(), data)
 	}

@@ -295,6 +295,7 @@ func rebuildPreviewSourceIndex(staticDir, buildHash string) {
 	previewSourceIndex.Lock()
 	previewSourceIndex.items = next
 	previewSourceIndex.Unlock()
+	log.Printf("preview index: rebuilt with %d entr(ies) for build %s", len(next), buildHash)
 }
 
 // previewSourceByHash looks up the original target URL for a preview hash
@@ -343,17 +344,20 @@ func previewImageHandler(cacheDir string, sourceForHash func(string) (string, bo
 		objectKey := previewObjectKey(targetURL)
 
 		if data, ok := getFreshPreviewFromMemory(objectKey); ok {
+			log.Printf("preview cache: memory hit for %s", targetURL)
 			servePreviewWebP(w, r, hashPart, time.Now(), data, previewTTL)
 			return
 		}
 
 		diskPath := filepath.Join(cacheDir, objectKey+".webp")
 		if data, modTime, ok := getFreshPreviewFromDisk(diskPath, previewTTL); ok {
+			log.Printf("preview cache: disk hit for %s (%s)", targetURL, diskPath)
 			storePreviewInMemory(objectKey, data)
 			servePreviewWebP(w, r, hashPart, modTime, data, previewTTL)
 			return
 		}
 
+		log.Printf("preview cache: miss for %s, fetching fresh copy", targetURL)
 		data, fetchErr := fetchPreviewImage(client, targetURL)
 		if fetchErr != nil {
 			log.Printf("preview fetch failed for %s: %v", targetURL, fetchErr)
@@ -363,6 +367,8 @@ func previewImageHandler(cacheDir string, sourceForHash func(string) (string, bo
 
 		if writeErr := os.WriteFile(diskPath, data, 0o644); writeErr != nil {
 			log.Printf("preview cache write failed for %s: %v", diskPath, writeErr)
+		} else {
+			log.Printf("preview cache: stored %s to disk (%s, %d bytes)", targetURL, diskPath, len(data))
 		}
 		storePreviewInMemory(objectKey, data)
 		servePreviewWebP(w, r, hashPart, time.Now(), data, previewTTL)
@@ -429,6 +435,7 @@ func getFreshPreviewFromMemory(key string) ([]byte, bool) {
 	previewCache.RUnlock()
 	if !ok || now.After(item.expiresAt) {
 		if ok {
+			log.Printf("preview cache: evicting expired memory entry %s", key)
 			previewCache.Lock()
 			delete(previewCache.items, key)
 			previewCache.Unlock()
@@ -458,6 +465,7 @@ func getFreshPreviewFromDisk(path string, ttl time.Duration) ([]byte, time.Time,
 		return nil, time.Time{}, false
 	}
 	if time.Since(info.ModTime()) > ttl {
+		log.Printf("preview cache: removing expired disk entry %s", path)
 		_ = os.Remove(path)
 		return nil, time.Time{}, false
 	}
@@ -477,7 +485,10 @@ func purgeExpiredPreviewFiles(cacheDir string, ttl time.Duration) {
 		return
 	}
 
+	log.Printf("preview cache: purging entries older than %s from %s (%d file(s) on disk)", ttl, cacheDir, len(entries))
+
 	now := time.Now()
+	removed := 0
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -489,8 +500,10 @@ func purgeExpiredPreviewFiles(cacheDir string, ttl time.Duration) {
 		}
 		if now.Sub(info.ModTime()) > ttl {
 			_ = os.Remove(path)
+			removed++
 		}
 	}
+	log.Printf("preview cache: purge complete, removed %d expired file(s) from %s", removed, cacheDir)
 }
 
 // servePreviewWebP writes data as an image/webp response with a

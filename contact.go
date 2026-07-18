@@ -12,6 +12,12 @@ import (
 	"strings"
 )
 
+// simError optionally forces contactHandler into a specific failure mode,
+// for exercising the frontend's error handling without actually breaking
+// anything real. Set via the -sim-error flag; see main.go. Empty (the
+// default) means contactHandler behaves normally.
+var simError string
+
 // FormData is the JSON body accepted by contactHandler, submitted by the
 // site's contact form.
 type FormData struct {
@@ -30,6 +36,40 @@ type FormData struct {
 // and sends both a confirmation email to the submitter and a notification
 // email to the business owner.
 func contactHandler(w http.ResponseWriter, r *http.Request) {
+	switch simError {
+	case "500":
+		log.Println("sim-error: simulating 500 Internal Server Error")
+		http.Error(w, `{"error":"simulated internal server error"}`, http.StatusInternalServerError)
+		return
+	case "503":
+		log.Println("sim-error: simulating 503 Service Unavailable")
+		http.Error(w, `{"error":"simulated service unavailable"}`, http.StatusServiceUnavailable)
+		return
+	case "429":
+		log.Println("sim-error: simulating 429 Too Many Requests")
+		w.Header().Set("Retry-After", "30")
+		http.Error(w, `{"error":"simulated rate limit exceeded"}`, http.StatusTooManyRequests)
+		return
+	case "timeout":
+		log.Println("sim-error: simulating a hung request (timeout)")
+		<-r.Context().Done()
+		return
+	case "drop":
+		log.Println("sim-error: simulating an abrupt connection drop")
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			log.Println("sim-error: hijack failed:", err)
+			return
+		}
+		conn.Close()
+		return
+	}
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return

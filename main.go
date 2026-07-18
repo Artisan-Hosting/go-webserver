@@ -35,6 +35,7 @@ func main() {
 	previewCacheDirFlag := flag.String("preview-cache-dir", defaultPreviewCacheDir, "directory for persisted server-side preview cache")
 	envPathFlag := flag.String("env-path", ".env", "path to a .env file to load into the process environment")
 	websiteFilesFlag := flag.String("website-files", "", "path to the static site directory; overrides WEBSITE_FILES from the env file/environment (default \"static\")")
+	flag.StringVar(&simError, "sim-error", "", "dev-only: force /api/contact into a simulated failure mode (500, 503, 429, timeout, drop) to test frontend error handling")
 	flag.Parse()
 
 	loadDotEnv(*envPathFlag)
@@ -51,6 +52,7 @@ func main() {
 	previewCacheDir := filepath.Clean(*previewCacheDirFlag)
 	initialBuildHash := computeSiteBuildHash(staticDir)
 	siteBuildHash.Store(initialBuildHash)
+	log.Printf("site build hash: %s (from %s)", initialBuildHash, staticDir)
 	rebuildPreviewSourceIndex(staticDir, initialBuildHash)
 	currentBuildHash := func() string {
 		if v := siteBuildHash.Load(); v != nil {
@@ -83,6 +85,7 @@ func main() {
 	go watchFiles(staticDir, func() {
 		nextHash := computeSiteBuildHash(staticDir)
 		siteBuildHash.Store(nextHash)
+		log.Printf("site build hash updated: %s", nextHash)
 		rebuildPreviewSourceIndex(staticDir, nextHash)
 	})
 
