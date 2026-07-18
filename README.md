@@ -9,6 +9,8 @@ handful of small dynamic features layered on top:
   get their `<img>` previews fetched, cached, and rewritten server-side.
 - **Contact form** (`/api/contact`) that emails both the submitter and the
   site owner, with optional [Cap](https://trycap.dev) captcha verification.
+  See [`docs/CAPTCHA_FRONTEND.md`](docs/CAPTCHA_FRONTEND.md) for how to build
+  the frontend side of this against the endpoints below.
 - **Themeable transactional email** — see [`docs/MAIL_THEMING.md`](docs/MAIL_THEMING.md).
 - **Live reload** during local development via a `/reload` Server-Sent-Events
   endpoint that fires whenever a static file changes.
@@ -18,7 +20,8 @@ handful of small dynamic features layered on top:
 ```
 .
 ├── docs/
-│   └── MAIL_THEMING.md   # transactional email layout/theming reference
+│   ├── MAIL_THEMING.md      # transactional email layout/theming reference
+│   └── CAPTCHA_FRONTEND.md  # frontend contact-form + Cap captcha integration reference
 ├── makefile              # build/run entry points
 ├── main.go               # flag parsing, route wiring, startup
 ├── env.go                # .env file loading
