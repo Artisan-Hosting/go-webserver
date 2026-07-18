@@ -125,6 +125,14 @@ Images are only ever downscaled, never upscaled — a source already within
 the resolved bounds is served as-is (after WebP conversion). Example:
 `/imgs/servers.jpg?w=1200&h=1600&q=80`.
 
+Converted variants are cached in memory per `(file, w, h, q)` combination.
+Each cache hit refreshes that entry's last-served time, so actively
+requested images stay cached indefinitely; an entry nobody has requested in
+24h (`imageCacheTTL`) is treated as stale on its next request and
+reconverted. A background sweep also runs every 24h to actively evict idle
+entries, so long-running deployments don't accumulate an unbounded number of
+cached size/quality variants over months of uptime.
+
 ## Adding this to a project
 
 This repo is the shared server engine (module path

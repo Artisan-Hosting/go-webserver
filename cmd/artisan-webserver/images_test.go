@@ -223,6 +223,113 @@ func TestResizeIfNeededUnconstrainedAxis(t *testing.T) {
 	}
 }
 
+func TestOptimizedImageHandlerReconvertsAfterIdleTTL(t *testing.T) {
+	resetWebPCache()
+	dir := t.TempDir()
+	imageDir := filepath.Join(dir, "imgs")
+	if err := os.Mkdir(imageDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(imageDir, "large.png")
+	if err := os.WriteFile(path, pngBytes(t, 800, 400), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fallback := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "fallback", http.StatusTeapot) })
+	handler := optimizedImageHandler(dir, fallback)
+
+	req := httptest.NewRequest(http.MethodGet, "/imgs/large.png", nil)
+	req.Header.Set("Accept", "image/webp")
+	first := httptest.NewRecorder()
+	handler(first, req)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first response=%d", first.Code)
+	}
+
+	// Backdate the entry's lastAccessed past imageCacheTTL, simulating an
+	// image nobody has requested in a while; a hit updates the key format,
+	// so find whatever key resetWebPCache/the handler produced.
+	webpCache.Lock()
+	if len(webpCache.items) != 1 {
+		webpCache.Unlock()
+		t.Fatalf("expected exactly one cache entry, got %d", len(webpCache.items))
+	}
+	for key, entry := range webpCache.items {
+		entry.lastAccessed = time.Now().Add(-imageCacheTTL - time.Minute)
+		webpCache.items[key] = entry
+	}
+	webpCache.Unlock()
+
+	second := httptest.NewRecorder()
+	handler(second, req)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second response=%d", second.Code)
+	}
+
+	webpCache.RLock()
+	defer webpCache.RUnlock()
+	if len(webpCache.items) != 1 {
+		t.Fatalf("expected the stale entry to be replaced, not duplicated: %d entries", len(webpCache.items))
+	}
+	for _, entry := range webpCache.items {
+		if time.Since(entry.lastAccessed) > time.Minute {
+			t.Fatalf("expected lastAccessed to be refreshed by the reconversion, got %v", entry.lastAccessed)
+		}
+	}
+}
+
+func TestOptimizedImageHandlerTouchesLastAccessedOnHit(t *testing.T) {
+	resetWebPCache()
+	dir := t.TempDir()
+	imageDir := filepath.Join(dir, "imgs")
+	if err := os.Mkdir(imageDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(imageDir, "large.png")
+	if err := os.WriteFile(path, pngBytes(t, 800, 400), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fallback := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "fallback", http.StatusTeapot) })
+	handler := optimizedImageHandler(dir, fallback)
+
+	req := httptest.NewRequest(http.MethodGet, "/imgs/large.png", nil)
+	req.Header.Set("Accept", "image/webp")
+	handler(httptest.NewRecorder(), req)
+
+	webpCache.Lock()
+	var key string
+	for k, entry := range webpCache.items {
+		key = k
+		entry.lastAccessed = time.Now().Add(-imageCacheTTL / 2)
+		webpCache.items[k] = entry
+	}
+	webpCache.Unlock()
+
+	handler(httptest.NewRecorder(), req)
+
+	webpCache.RLock()
+	defer webpCache.RUnlock()
+	if time.Since(webpCache.items[key].lastAccessed) > time.Second {
+		t.Fatal("cache hit did not refresh lastAccessed")
+	}
+}
+
+func TestPruneExpiredImageCache(t *testing.T) {
+	cache := newWebPConversionCache()
+	cache.items["fresh"] = cachedWebP{data: []byte("a"), lastAccessed: time.Now()}
+	cache.items["stale"] = cachedWebP{data: []byte("b"), lastAccessed: time.Now().Add(-2 * time.Hour)}
+
+	pruneExpiredImageCache(cache, time.Hour)
+
+	cache.RLock()
+	defer cache.RUnlock()
+	if _, ok := cache.items["stale"]; ok {
+		t.Fatal("stale entry should have been pruned")
+	}
+	if _, ok := cache.items["fresh"]; !ok {
+		t.Fatal("fresh entry should have survived pruning")
+	}
+}
+
 func TestResizeToFit(t *testing.T) {
 	small := image.NewRGBA(image.Rect(5, 5, 105, 55))
 	if got := resizeToFit(small, 512, 256); got != small {

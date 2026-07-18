@@ -34,6 +34,13 @@ const (
 	// minWebPQuality and maxWebPQuality clamp the q query param.
 	minWebPQuality = 30
 	maxWebPQuality = 95
+	// imageCacheTTL bounds how long a converted /imgs/ variant may sit idle
+	// in memory before it's evicted. Every cache hit refreshes an entry's
+	// lastAccessed time, so actively-requested images stay cached
+	// indefinitely; only variants nobody has asked for in imageCacheTTL age
+	// out. This keeps long-running deployments (months of uptime) from
+	// accumulating an unbounded number of cached size/quality variants.
+	imageCacheTTL = 24 * time.Hour
 )
 
 // imageRequestOptions carries the resolved per-request resize/quality
@@ -45,10 +52,12 @@ type imageRequestOptions struct {
 }
 
 // cachedWebP holds a previously converted WebP image plus the source file's
-// modification time, used to detect when the cached copy is stale.
+// modification time (used to detect when the cached copy is stale) and the
+// last time it was served (used to evict idle entries, see imageCacheTTL).
 type cachedWebP struct {
-	data    []byte
-	modTime time.Time
+	data         []byte
+	modTime      time.Time
+	lastAccessed time.Time
 }
 
 type webpConversionCache struct {
@@ -63,6 +72,29 @@ func newWebPConversionCache() *webpConversionCache {
 // webpCache backs the legacy handler constructor. Constructed servers use an
 // instance-owned cache so tests and multiple servers remain isolated.
 var webpCache = newWebPConversionCache()
+
+// pruneExpiredImageCache removes cached WebP variants that haven't been
+// served in ttl, reclaiming memory from images nobody is requesting anymore
+// (e.g. removed from the site, or a superseded w/h/q variant). Actively
+// requested entries are untouched because a cache hit refreshes
+// lastAccessed. Run periodically (see run() in main.go) rather than relying
+// solely on the lazy check in optimizedImageHandlerWithCache, since that
+// only evicts an entry when something asks for it again.
+func pruneExpiredImageCache(cache *webpConversionCache, ttl time.Duration) {
+	cache.Lock()
+	defer cache.Unlock()
+	now := time.Now()
+	removed := 0
+	for key, entry := range cache.items {
+		if now.Sub(entry.lastAccessed) > ttl {
+			delete(cache.items, key)
+			removed++
+		}
+	}
+	if removed > 0 {
+		log.Printf("image cache: pruned %d expired entr(ies), %d remaining", removed, len(cache.items))
+	}
+}
 
 // optimizedImageHandler returns an http.HandlerFunc that serves images under
 // staticDir as WebP when the requesting client advertises WebP support via
@@ -117,8 +149,12 @@ func optimizedImageHandlerWithCache(staticDir string, fallback http.Handler, cac
 		cached, ok := cache.items[key]
 		cache.RUnlock()
 
-		if ok && info.ModTime().Equal(cached.modTime) {
+		if ok && info.ModTime().Equal(cached.modTime) && time.Since(cached.lastAccessed) <= imageCacheTTL {
 			log.Printf("image cache: hit for %s", fullPath)
+			cache.Lock()
+			cached.lastAccessed = time.Now()
+			cache.items[key] = cached
+			cache.Unlock()
 			serveWebP(w, r, fullPath, cached.modTime, cached.data)
 			return
 		}
@@ -159,7 +195,7 @@ func optimizedImageHandlerWithCache(staticDir string, fallback http.Handler, cac
 
 		data := buf.Bytes()
 		cache.Lock()
-		cache.items[key] = cachedWebP{data: data, modTime: info.ModTime()}
+		cache.items[key] = cachedWebP{data: data, modTime: info.ModTime(), lastAccessed: time.Now()}
 		cache.Unlock()
 		log.Printf("image cache: stored %s (%d bytes)", fullPath, len(data))
 
