@@ -36,12 +36,18 @@ type cachedWebP struct {
 	modTime time.Time
 }
 
-// webpCache memoizes converted WebP images for /imgs/ requests, keyed by the
-// absolute path of the source file on disk.
-var webpCache = struct {
+type webpConversionCache struct {
 	sync.RWMutex
 	items map[string]cachedWebP
-}{items: make(map[string]cachedWebP)}
+}
+
+func newWebPConversionCache() *webpConversionCache {
+	return &webpConversionCache{items: make(map[string]cachedWebP)}
+}
+
+// webpCache backs the legacy handler constructor. Constructed servers use an
+// instance-owned cache so tests and multiple servers remain isolated.
+var webpCache = newWebPConversionCache()
 
 // optimizedImageHandler returns an http.HandlerFunc that serves images under
 // staticDir as WebP when the requesting client advertises WebP support via
@@ -50,6 +56,10 @@ var webpCache = struct {
 // extension, missing file) fall back to the provided fallback handler
 // (typically the static file server).
 func optimizedImageHandler(staticDir string, fallback http.Handler) http.HandlerFunc {
+	return optimizedImageHandlerWithCache(staticDir, fallback, webpCache)
+}
+
+func optimizedImageHandlerWithCache(staticDir string, fallback http.Handler, cache *webpConversionCache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			fallback.ServeHTTP(w, r)
@@ -87,9 +97,9 @@ func optimizedImageHandler(staticDir string, fallback http.Handler) http.Handler
 
 		key := fullPath
 
-		webpCache.RLock()
-		cached, ok := webpCache.items[key]
-		webpCache.RUnlock()
+		cache.RLock()
+		cached, ok := cache.items[key]
+		cache.RUnlock()
 
 		if ok && info.ModTime().Equal(cached.modTime) {
 			log.Printf("image cache: hit for %s", fullPath)
@@ -132,9 +142,9 @@ func optimizedImageHandler(staticDir string, fallback http.Handler) http.Handler
 		}
 
 		data := buf.Bytes()
-		webpCache.Lock()
-		webpCache.items[key] = cachedWebP{data: data, modTime: info.ModTime()}
-		webpCache.Unlock()
+		cache.Lock()
+		cache.items[key] = cachedWebP{data: data, modTime: info.ModTime()}
+		cache.Unlock()
 		log.Printf("image cache: stored %s (%d bytes)", fullPath, len(data))
 
 		serveWebP(w, r, fullPath, info.ModTime(), data)

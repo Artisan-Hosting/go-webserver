@@ -185,5 +185,20 @@ content directory without touching the environment).
 ## Testing
 
 ```sh
-go test ./...
+make test              # complete local quality gate
+make test-fast         # standard Go suite only
+make test-race         # race detector
+make test-integration  # build and exercise the real server process
+make test-cover        # coverage report + 70% minimum gate
 ```
+
+`make test` runs vet, the standard suite, the race detector, the tagged
+process smoke test, and the coverage gate. Coverage artifacts are written to
+`.build/coverage/coverage.out` and `.build/coverage/coverage.html`.
+
+The normal suite uses temporary directories and in-memory/fake HTTP transports;
+it does not contact the production mail relay, captcha service, or screenshot
+service. The integration target binds an ephemeral loopback port, verifies
+startup and the public routes against the built binary, then checks graceful
+shutdown. Override the coverage threshold when needed with, for example,
+`make test-cover COVERAGE_MIN=80`.

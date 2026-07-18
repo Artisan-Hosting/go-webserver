@@ -17,13 +17,19 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -31,12 +37,26 @@ import (
 // background static-file watcher and preview cache janitor, and blocks
 // serving HTTP until the process exits.
 func main() {
-	port := flag.Int("port", 8082, "port to listen on")
-	previewCacheDirFlag := flag.String("preview-cache-dir", defaultPreviewCacheDir, "directory for persisted server-side preview cache")
-	envPathFlag := flag.String("env-path", ".env", "path to a .env file to load into the process environment")
-	websiteFilesFlag := flag.String("website-files", "", "path to the static site directory; overrides WEBSITE_FILES from the env file/environment (default \"static\")")
-	flag.StringVar(&simError, "sim-error", "", "dev-only: force /api/contact into a simulated failure mode (500, 503, 429, timeout, drop) to test frontend error handling")
-	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:]); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// run parses configuration, constructs the server, starts background work,
+// and serves until ctx is canceled. Keeping lifecycle work out of main makes
+// startup and shutdown testable without special process hooks.
+func run(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("artisan-webserver", flag.ContinueOnError)
+	port := fs.Int("port", 8082, "port to listen on")
+	previewCacheDirFlag := fs.String("preview-cache-dir", defaultPreviewCacheDir, "directory for persisted server-side preview cache")
+	envPathFlag := fs.String("env-path", ".env", "path to a .env file to load into the process environment")
+	websiteFilesFlag := fs.String("website-files", "", "path to the static site directory; overrides WEBSITE_FILES from the env file/environment (default \"static\")")
+	simulatedError := fs.String("sim-error", "", "dev-only: force /api/contact into a simulated failure mode (500, 503, 429, timeout, drop) to test frontend error handling")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	loadDotEnv(*envPathFlag)
 
@@ -51,11 +71,13 @@ func main() {
 	staticDir = filepath.Clean(staticDir)
 	previewCacheDir := filepath.Clean(*previewCacheDirFlag)
 	initialBuildHash := computeSiteBuildHash(staticDir)
-	siteBuildHash.Store(initialBuildHash)
+	var currentSiteBuildHash atomic.Value
+	currentSiteBuildHash.Store(initialBuildHash)
 	log.Printf("site build hash: %s (from %s)", initialBuildHash, staticDir)
-	rebuildPreviewSourceIndex(staticDir, initialBuildHash)
+	previews := newPreviewState()
+	previews.rebuildSourceIndex(staticDir, initialBuildHash)
 	currentBuildHash := func() string {
-		if v := siteBuildHash.Load(); v != nil {
+		if v := currentSiteBuildHash.Load(); v != nil {
 			if s, ok := v.(string); ok && s != "" {
 				return s
 			}
@@ -69,35 +91,56 @@ func main() {
 	purgeExpiredPreviewFiles(previewCacheDir, previewTTL)
 
 	// Serve static files
-	fs := http.FileServer(http.Dir(staticDir))
-	http.HandleFunc("/imgs/", optimizedImageHandler(staticDir, fs))
-	http.HandleFunc("/__preview/", previewImageHandler(previewCacheDir, previewSourceByHash))
-	http.Handle("/", htmlPreviewRewriteHandler(staticDir, fs, currentBuildHash))
-
-	// contact endpoint
-	http.HandleFunc("/api/contact", contactHandler)
-	http.HandleFunc("/api/captcha-config", captchaConfigHandler)
-
-	// SSE endpoint to notify changes
-	http.HandleFunc("/reload", reloadHandler)
+	hub := newReloadHub()
+	handler := newServerHandler(serverConfig{
+		staticDir:       staticDir,
+		previewCacheDir: previewCacheDir,
+		simError:        *simulatedError,
+		buildHash:       currentBuildHash,
+		hub:             hub,
+		previewState:    previews,
+	}, serverDependencies{})
+	addr := fmt.Sprintf("0.0.0.0:%d", *port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
 
 	// Watch for changes
-	go watchFiles(staticDir, func() {
+	go watchFilesContext(ctx, staticDir, func() {
 		nextHash := computeSiteBuildHash(staticDir)
-		siteBuildHash.Store(nextHash)
+		currentSiteBuildHash.Store(nextHash)
 		log.Printf("site build hash updated: %s", nextHash)
-		rebuildPreviewSourceIndex(staticDir, nextHash)
-	})
+		previews.rebuildSourceIndex(staticDir, nextHash)
+	}, hub)
 
 	go func() {
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
-		for range ticker.C {
-			purgeExpiredPreviewFiles(previewCacheDir, previewTTL)
+		for {
+			select {
+			case <-ticker.C:
+				purgeExpiredPreviewFiles(previewCacheDir, previewTTL)
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 
-	addr := fmt.Sprintf("0.0.0.0:%d", *port)
-	log.Printf("Starting server on :%d", *port)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	server := &http.Server{Handler: handler}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("server shutdown: %v", err)
+		}
+	}()
+
+	log.Printf("Starting server on %s", listener.Addr())
+	err = server.Serve(listener)
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }

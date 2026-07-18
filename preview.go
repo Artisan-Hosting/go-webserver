@@ -16,7 +16,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/chai2010/webp"
@@ -41,11 +40,6 @@ const (
 // safely lost on reboot.
 var defaultPreviewCacheDir = filepath.Join(os.TempDir(), "artisan-webserver", "previews")
 
-// siteBuildHash holds the current build hash of the static site (see
-// computeSiteBuildHash), used to key preview URLs so that a rebuild of the
-// static assets invalidates previously generated preview links.
-var siteBuildHash atomic.Value
-
 // previewCacheEntry is an in-memory cached preview image plus its
 // expiration time.
 type previewCacheEntry struct {
@@ -53,22 +47,23 @@ type previewCacheEntry struct {
 	expiresAt time.Time
 }
 
-// previewCache is the in-memory, TTL-based cache of fetched preview images,
-// keyed by previewObjectKey(targetURL). It sits in front of the on-disk
-// cache to avoid repeated file reads for hot preview links.
-var previewCache = struct {
-	sync.RWMutex
-	items map[string]previewCacheEntry
-}{items: make(map[string]previewCacheEntry)}
+type previewState struct {
+	cacheMu    sync.RWMutex
+	cacheItems map[string]previewCacheEntry
+	sourceMu   sync.RWMutex
+	sources    map[string]string
+}
 
-// previewSourceIndex maps a preview cache hash (previewCacheKey) back to the
-// original absolute target URL it was derived from, so that requests to
-// /__preview/<hash>.webp can be resolved without re-parsing every HTML page
-// on each request. It is rebuilt whenever the static site changes.
-var previewSourceIndex = struct {
-	sync.RWMutex
-	items map[string]string
-}{items: make(map[string]string)}
+func newPreviewState() *previewState {
+	return &previewState{
+		cacheItems: make(map[string]previewCacheEntry),
+		sources:    make(map[string]string),
+	}
+}
+
+// defaultPreviewState backs compatibility helpers. Each constructed server
+// receives its own state through serverConfig.
+var defaultPreviewState = newPreviewState()
 
 // serverPreviewImgTagRE matches <img> tags carrying a
 // data-server-preview-url attribute, which marks images that should be
@@ -117,12 +112,12 @@ func htmlPreviewRewriteHandler(staticDir string, fallback http.Handler, buildHas
 // matching HTML file exists within staticDir, guarding against path
 // traversal outside of it.
 func resolveHTMLPath(staticDir, requestPath string) (string, os.FileInfo, bool) {
+	directoryRequest := strings.HasSuffix(requestPath, "/")
 	cleaned := path.Clean("/" + requestPath)
 	if cleaned == "/" {
 		cleaned = "/index.html"
-	}
-	if strings.HasSuffix(cleaned, "/") {
-		cleaned += "index.html"
+	} else if directoryRequest {
+		cleaned += "/index.html"
 	}
 
 	candidates := []string{cleaned}
@@ -261,6 +256,10 @@ func computeSiteBuildHash(staticDir string) string {
 // that previewSourceByHash can resolve incoming /__preview/ requests. It is
 // called at startup and whenever the static site changes.
 func rebuildPreviewSourceIndex(staticDir, buildHash string) {
+	defaultPreviewState.rebuildSourceIndex(staticDir, buildHash)
+}
+
+func (state *previewState) rebuildSourceIndex(staticDir, buildHash string) {
 	next := make(map[string]string)
 	root := filepath.Clean(staticDir)
 
@@ -292,9 +291,9 @@ func rebuildPreviewSourceIndex(staticDir, buildHash string) {
 		return nil
 	})
 
-	previewSourceIndex.Lock()
-	previewSourceIndex.items = next
-	previewSourceIndex.Unlock()
+	state.sourceMu.Lock()
+	state.sources = next
+	state.sourceMu.Unlock()
 	log.Printf("preview index: rebuilt with %d entr(ies) for build %s", len(next), buildHash)
 }
 
@@ -302,9 +301,13 @@ func rebuildPreviewSourceIndex(staticDir, buildHash string) {
 // previously produced by previewCacheKey, as populated by
 // rebuildPreviewSourceIndex.
 func previewSourceByHash(hash string) (string, bool) {
-	previewSourceIndex.RLock()
-	target, ok := previewSourceIndex.items[hash]
-	previewSourceIndex.RUnlock()
+	return defaultPreviewState.sourceByHash(hash)
+}
+
+func (state *previewState) sourceByHash(hash string) (string, bool) {
+	state.sourceMu.RLock()
+	target, ok := state.sources[hash]
+	state.sourceMu.RUnlock()
 	return target, ok
 }
 
@@ -316,11 +319,36 @@ func previewSourceByHash(hash string) (string, bool) {
 // both caches. If no source can be resolved or fetched, it falls back to a
 // redirect to a static placeholder image.
 func previewImageHandler(cacheDir string, sourceForHash func(string) (string, bool)) http.HandlerFunc {
+	return previewImageHandlerWithDependencies(
+		cacheDir,
+		sourceForHash,
+		&http.Client{Timeout: 12 * time.Second},
+		fetchPreviewImage,
+		time.Now,
+	)
+}
+
+func previewImageHandlerWithDependencies(
+	cacheDir string,
+	sourceForHash func(string) (string, bool),
+	client *http.Client,
+	fetch func(*http.Client, string) ([]byte, error),
+	now func() time.Time,
+) http.HandlerFunc {
+	return previewImageHandlerWithStateDependencies(cacheDir, sourceForHash, client, fetch, now, defaultPreviewState)
+}
+
+func previewImageHandlerWithStateDependencies(
+	cacheDir string,
+	sourceForHash func(string) (string, bool),
+	client *http.Client,
+	fetch func(*http.Client, string) ([]byte, error),
+	now func() time.Time,
+	state *previewState,
+) http.HandlerFunc {
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		log.Printf("preview cache dir create failed: %v", err)
 	}
-
-	client := &http.Client{Timeout: 12 * time.Second}
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -343,22 +371,22 @@ func previewImageHandler(cacheDir string, sourceForHash func(string) (string, bo
 
 		objectKey := previewObjectKey(targetURL)
 
-		if data, ok := getFreshPreviewFromMemory(objectKey); ok {
+		if data, ok := state.getFreshFromMemory(objectKey); ok {
 			log.Printf("preview cache: memory hit for %s", targetURL)
-			servePreviewWebP(w, r, hashPart, time.Now(), data, previewTTL)
+			servePreviewWebP(w, r, hashPart, now(), data, previewTTL)
 			return
 		}
 
 		diskPath := filepath.Join(cacheDir, objectKey+".webp")
 		if data, modTime, ok := getFreshPreviewFromDisk(diskPath, previewTTL); ok {
 			log.Printf("preview cache: disk hit for %s (%s)", targetURL, diskPath)
-			storePreviewInMemory(objectKey, data)
+			state.storeInMemory(objectKey, data)
 			servePreviewWebP(w, r, hashPart, modTime, data, previewTTL)
 			return
 		}
 
 		log.Printf("preview cache: miss for %s, fetching fresh copy", targetURL)
-		data, fetchErr := fetchPreviewImage(client, targetURL)
+		data, fetchErr := fetch(client, targetURL)
 		if fetchErr != nil {
 			log.Printf("preview fetch failed for %s: %v", targetURL, fetchErr)
 			http.Redirect(w, r, "/images/featured-placeholder.svg", http.StatusTemporaryRedirect)
@@ -370,8 +398,8 @@ func previewImageHandler(cacheDir string, sourceForHash func(string) (string, bo
 		} else {
 			log.Printf("preview cache: stored %s to disk (%s, %d bytes)", targetURL, diskPath, len(data))
 		}
-		storePreviewInMemory(objectKey, data)
-		servePreviewWebP(w, r, hashPart, time.Now(), data, previewTTL)
+		state.storeInMemory(objectKey, data)
+		servePreviewWebP(w, r, hashPart, now(), data, previewTTL)
 	}
 }
 
@@ -429,16 +457,20 @@ func fetchPreviewImage(client *http.Client, targetURL string) ([]byte, error) {
 // previewCache if present and not yet expired, evicting it if it has
 // expired.
 func getFreshPreviewFromMemory(key string) ([]byte, bool) {
+	return defaultPreviewState.getFreshFromMemory(key)
+}
+
+func (state *previewState) getFreshFromMemory(key string) ([]byte, bool) {
 	now := time.Now()
-	previewCache.RLock()
-	item, ok := previewCache.items[key]
-	previewCache.RUnlock()
+	state.cacheMu.RLock()
+	item, ok := state.cacheItems[key]
+	state.cacheMu.RUnlock()
 	if !ok || now.After(item.expiresAt) {
 		if ok {
 			log.Printf("preview cache: evicting expired memory entry %s", key)
-			previewCache.Lock()
-			delete(previewCache.items, key)
-			previewCache.Unlock()
+			state.cacheMu.Lock()
+			delete(state.cacheItems, key)
+			state.cacheMu.Unlock()
 		}
 		return nil, false
 	}
@@ -449,12 +481,16 @@ func getFreshPreviewFromMemory(key string) ([]byte, bool) {
 // fresh expiration previewTTL from now. The stored bytes are copied so
 // callers may reuse their buffer.
 func storePreviewInMemory(key string, data []byte) {
-	previewCache.Lock()
-	previewCache.items[key] = previewCacheEntry{
+	defaultPreviewState.storeInMemory(key, data)
+}
+
+func (state *previewState) storeInMemory(key string, data []byte) {
+	state.cacheMu.Lock()
+	state.cacheItems[key] = previewCacheEntry{
 		data:      append([]byte(nil), data...),
 		expiresAt: time.Now().Add(previewTTL),
 	}
-	previewCache.Unlock()
+	state.cacheMu.Unlock()
 }
 
 // getFreshPreviewFromDisk reads a cached preview image from path if it

@@ -37,6 +37,10 @@ func captchaConfigHandler(w http.ResponseWriter, r *http.Request) {
 // verifyCaptcha calls the Cap instance's siteverify endpoint, matching the
 // reCAPTCHA-compatible contract documented at https://trycap.dev/guide/.
 func verifyCaptcha(endpoint, secret, token string) (bool, error) {
+	return verifyCaptchaWithClient(&http.Client{Timeout: 5 * time.Second}, endpoint, secret, token)
+}
+
+func verifyCaptchaWithClient(client *http.Client, endpoint, secret, token string) (bool, error) {
 	verifyURL := strings.TrimRight(endpoint, "/") + "/siteverify"
 	body, err := json.Marshal(map[string]string{
 		"secret":   secret,
@@ -52,7 +56,6 @@ func verifyCaptcha(endpoint, secret, token string) (bool, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return false, err

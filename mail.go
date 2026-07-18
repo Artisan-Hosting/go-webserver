@@ -23,50 +23,57 @@ type EmailPayload struct {
 	Body        string `json:"body"`
 }
 
+const defaultMailRelayURL = "https://relay.artisanhosting.net/api/sendmail"
+
+type relayMailer struct {
+	url    string
+	client *http.Client
+}
+
 // sendMail posts payload to the Artisan Hosting relay service, which
-// performs the actual SMTP delivery. Errors are logged rather than
-// returned since callers treat outbound mail as fire-and-forget.
-func sendMail(payload EmailPayload) {
-	url := "https://relay.artisanhosting.net/api/sendmail"
-	jsonData, err := json.Marshal(payload)
-	if err != nil {
-		fmt.Println("Error encoding JSON:", err)
-		return
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		fmt.Println("Error creating request:", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
+// performs the actual SMTP delivery. The contact handler logs returned
+// errors while preserving its fire-and-forget API response behavior.
+func sendMail(payload EmailPayload) error {
 	client := &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // #nosec G402 -- retained for compatibility with the deployed relay.
 		},
 	}
-	resp, err := client.Do(req)
+	return (relayMailer{url: defaultMailRelayURL, client: client}).Send(payload)
+}
+
+func (m relayMailer) Send(payload EmailPayload) error {
+	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		fmt.Println("Error sending request:", err)
-		return
+		return fmt.Errorf("encode mail payload: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, m.url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("create mail request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	if m.client == nil {
+		m.client = http.DefaultClient
+	}
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("send mail request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	var responseData map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&responseData); err != nil {
-		fmt.Println("Error decoding response:", err)
-		return
+		return fmt.Errorf("decode mail response: %w", err)
 	}
 
 	if responseData["status"] == "success" {
 		fmt.Println("Success:", responseData["message"])
-	} else {
-		fmt.Println("Failed:", responseData["message"])
+		return nil
 	}
+	return fmt.Errorf("mail relay failed: %v", responseData["message"])
 }
 
 // defaultMailThemeCSS is the theme CSS file used when MAIL_THEME_CSS is not
