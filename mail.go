@@ -72,7 +72,7 @@ func sendMail(payload EmailPayload) {
 // defaultMailThemeCSS is the theme CSS file used when MAIL_THEME_CSS is not
 // set in the environment. See docs/MAIL_THEMING.md for how to point a
 // deployment at its own theme instead.
-const defaultMailThemeCSS = "server/theme/default.css"
+const defaultMailThemeCSS = "theme/default.css"
 
 // hermesEngine lazily builds the package-wide Hermes instance from
 // environment config on first use, and reuses it for every email rendered
@@ -80,7 +80,7 @@ const defaultMailThemeCSS = "server/theme/default.css"
 var hermesEngine = sync.OnceValue(newHermesEngine)
 
 // newHermesEngine reads MAIL_THEME_CSS and MAIL_PRODUCT_* from the
-// environment (loaded from server/.env by loadDotEnv, or the real process
+// environment (loaded from .env by loadDotEnv, or the real process
 // environment) to build a Hermes engine configured for this deployment. A
 // site rebrands entirely through these values and a CSS file — no Go code
 // changes required.

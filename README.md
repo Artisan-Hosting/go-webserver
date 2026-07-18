@@ -20,43 +20,42 @@ handful of small dynamic features layered on top:
 ├── docs/
 │   └── MAIL_THEMING.md   # transactional email layout/theming reference
 ├── makefile              # build/run entry points
-└── server/                # the Go module — everything the binary needs
-    ├── main.go            # flag parsing, route wiring, startup
-    ├── env.go              # .env file loading
-    ├── captcha.go          # Cap captcha verification for the contact form
-    ├── mail.go             # outbound mail relay client + theming engine
-    ├── mailtheme.go         # fixed HTML email skeleton (hermes.Theme)
-    ├── contact.go          # POST /api/contact handler
-    ├── email_templates.go  # HTML/plain-text email bodies (data only)
-    ├── images.go           # on-the-fly WebP conversion for /imgs/
-    ├── preview.go           # server-side link-preview fetching/caching
-    ├── watch.go             # filesystem watching + live-reload SSE
-    ├── theme/
-    │   └── default.css      # default transactional-email theme
-    ├── go.mod / go.sum
-    └── bin                  # build output (gitignored, not committed)
+├── main.go               # flag parsing, route wiring, startup
+├── env.go                # .env file loading
+├── captcha.go            # Cap captcha verification for the contact form
+├── mail.go               # outbound mail relay client + theming engine
+├── mailtheme.go          # fixed HTML email skeleton (hermes.Theme)
+├── contact.go            # POST /api/contact handler
+├── email_templates.go    # HTML/plain-text email bodies (data only)
+├── images.go             # on-the-fly WebP conversion for /imgs/
+├── preview.go            # server-side link-preview fetching/caching
+├── watch.go              # filesystem watching + live-reload SSE
+├── theme/
+│   └── default.css       # default transactional-email theme
+├── go.mod / go.sum
+└── bin                   # build output (gitignored, not committed)
 ```
 
-`static/` (the site content served at `/`) and `server/.env` (per-deployment
+`static/` (the site content served at `/`) and `.env` (per-deployment
 secrets/config) are **not part of this repo** — they're provided by whatever
 site deploys this server. See [Deployment](#deployment) below.
 
 ## Requirements
 
-- Go 1.24.2+ (see `server/go.mod`; CI/dev machines should have at least the
+- Go 1.24.2+ (see `go.mod`; CI/dev machines should have at least the
   `go1.24.7` toolchain it pins).
 
 ## Quick start
 
 ```sh
-make build   # cd server && go build -o ./bin
-make run     # build, then run server/bin from the repo root
+make build   # go build -o ./bin
+make run     # build, then run ./bin from the repo root
 ```
 
 The server needs to run with its working directory at the repo root (or
-wherever `static/` and `server/` live side by side for your deployment) —
-all relative paths (`static`, `server/.env`, `server/theme/default.css`,
-etc.) are resolved from there, unless overridden by the flags below.
+wherever `static/` and this repo live side by side for your deployment) —
+all relative paths (`static`, `.env`, `theme/default.css`, etc.) are
+resolved from there, unless overridden by the flags below.
 
 ## CLI flags
 
@@ -65,20 +64,20 @@ All flags are optional; defaults preserve the server's original behavior.
 | Flag | Default | Effect |
 |---|---|---|
 | `-port` | `8082` | Port to listen on. |
-| `-env-path` | `server/.env` | Path to the `.env` file to load into the process environment at startup. |
+| `-env-path` | `.env` | Path to the `.env` file to load into the process environment at startup. |
 | `-website-files` | *(unset)* | Path to the static site directory. Overrides `WEBSITE_FILES` from the env file/environment. Falls back to `WEBSITE_FILES`, then to `"static"`, if unset. |
 | `-preview-cache-dir` | `$TMPDIR/artisan-webserver/previews` | Directory for persisted server-side link-preview images. |
 
 Example:
 
 ```sh
-server/bin -port 4000 -website-files /var/www/example/static -env-path /etc/example/.env
+./bin -port 4000 -website-files /var/www/example/static -env-path /etc/example/.env
 ```
 
 ## Environment variables
 
 Read from the process environment — normally via the `.env` file at
-`-env-path` (loaded by `loadDotEnv()`, see `server/env.go`), or the real
+`-env-path` (loaded by `loadDotEnv()`, see `env.go`), or the real
 process environment, which always wins over the `.env` file. `WEBSITE_FILES`
 additionally sits underneath the `-website-files` CLI flag, which wins over
 both.
@@ -89,7 +88,7 @@ both.
 | `CAPTCHA_API_ENDPOINT` | *(unset)* | Self-hosted [Cap](https://trycap.dev) instance site path, e.g. `https://cap.example.com/<site-key>/`. Leaving this or `CAPTCHA_SECRET_KEY` unset disables captcha enforcement on the contact form. |
 | `CAPTCHA_SECRET_KEY` | *(unset)* | Secret key matching the Cap site key above. |
 | `CONTACT_OWNER_EMAIL` | `info@artisanhosting.net` | Where the contact form's owner-notification email is sent. |
-| `MAIL_THEME_CSS` | `server/theme/default.css` | Path to the transactional-email theme CSS file. |
+| `MAIL_THEME_CSS` | `theme/default.css` | Path to the transactional-email theme CSS file. |
 | `MAIL_PRODUCT_NAME` | `Artisan Studios` | Shown in email masthead, footer, signature. |
 | `MAIL_PRODUCT_LINK` | `https://www.artisanhosting.net` | Email masthead/footer link target. |
 | `MAIL_PRODUCT_LOGO` | *(unset)* | Masthead logo image URL; falls back to product name as text. |
@@ -114,7 +113,7 @@ This repo is the shared server engine. A deployed site typically looks like:
 
 ```
 /var/www/<site>/
-├── server/       # this repo's server/ subtree
+├── server/       # this repo, checked out here
 ├── static/       # the site's own static content
 └── server/.env   # the site's own secrets/config (see Environment variables above)
 ```
@@ -149,5 +148,5 @@ content directory without touching the environment).
 ## Testing
 
 ```sh
-cd server && go test ./...
+go test ./...
 ```

@@ -2,8 +2,7 @@
 	build
 
 build:
-	cd server/ && \
-	go build -o ./bin 
+	go build -o ./bin
 
 run: build
-	server/bin
+	./bin

@@ -15,7 +15,7 @@ import (
 //
 // buildOwnerEmail and buildClientEmail describe emails as plain data
 // (hermes.Body{}) — no HTML/CSS lives here. Layout and styling come from
-// server/mailtheme.go and server/theme/*.css. See docs/MAIL_THEMING.md
+// mailtheme.go and theme/*.css. See docs/MAIL_THEMING.md
 // for how to add another email the same way.
 
 // buildOwnerMessage assembles a plain-text fallback message for the business

@@ -33,7 +33,7 @@ import (
 func main() {
 	port := flag.Int("port", 8082, "port to listen on")
 	previewCacheDirFlag := flag.String("preview-cache-dir", defaultPreviewCacheDir, "directory for persisted server-side preview cache")
-	envPathFlag := flag.String("env-path", "server/.env", "path to a .env file to load into the process environment")
+	envPathFlag := flag.String("env-path", ".env", "path to a .env file to load into the process environment")
 	websiteFilesFlag := flag.String("website-files", "", "path to the static site directory; overrides WEBSITE_FILES from the env file/environment (default \"static\")")
 	flag.Parse()
 

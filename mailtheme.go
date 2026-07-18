@@ -9,7 +9,7 @@ import (
 // siteTheme is the single hand-written email layout used by every
 // transactional email this server sends. It is the only file in the
 // project that contains raw HTML/CSS structure for email — everything else
-// (server/theme/*.css, individual emails in email_templates.go) is data:
+// (theme/*.css, individual emails in email_templates.go) is data:
 // CSS values or hermes.Body{} struct literals.
 //
 // The HTML skeleton below is fixed and must not change per deployment; only
