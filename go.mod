@@ -1,4 +1,4 @@
-module Dj-Codeman/web_server
+module github.com/Artisan-Hosting/go-webserver
 
 go 1.24.2
 

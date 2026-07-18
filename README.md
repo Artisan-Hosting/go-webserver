@@ -107,6 +107,30 @@ system and how to add a per-site theme.
 | `GET /api/captcha-config` | `captchaConfigHandler` | Public captcha config (enabled flag + endpoint) for the frontend widget. |
 | `GET /reload` | `reloadHandler` | Server-Sent-Events stream that fires on static file changes, for live reload during local dev. |
 
+## Adding this to a project
+
+This repo is the shared server engine (module path
+`github.com/Artisan-Hosting/go-webserver`). There are two ways to pull it
+into a site:
+
+**New projects — `go install`, no source checkout.** Since `-website-files`
+and `-env-path` let a single installed binary point at any site's
+`static/`/`.env`, you generally don't need to vendor the source at all:
+
+```sh
+go install github.com/Artisan-Hosting/go-webserver@latest
+```
+
+This installs a binary named `go-webserver` into `$(go env GOPATH)/bin`.
+Run it from the site's root (so `static`/`.env` resolve normally), or pass
+`-website-files`/`-env-path` explicitly to point it elsewhere. Pin a
+released tag (`@v0.1.0`, etc.) instead of `@latest` once this repo starts
+tagging releases, for reproducible deploys.
+
+**Existing projects that vendor the source** — add this repo as a git
+submodule (conventionally mounted at `server/`), then build with
+`make build`.
+
 ## Deployment
 
 This repo is the shared server engine. A deployed site typically looks like:
