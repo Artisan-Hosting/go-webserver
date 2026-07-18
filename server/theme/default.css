@@ -1,0 +1,162 @@
+/*
+ * Default (generic) email theme.
+ *
+ * This file only sets appearance — colors, fonts, spacing. It must not
+ * introduce new selectors beyond the ones documented in
+ * server/MAIL_THEMING.md, since the HTML structure in server/mailtheme.go
+ * is fixed and only styles the classes below.
+ *
+ * To brand this for a specific site deployment, copy this file, change the
+ * values, and point MAIL_THEME_CSS at the copy — see server/MAIL_THEMING.md.
+ */
+
+body, html {
+  background: #f4f5f7;
+  color: #24292f;
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+a {
+  color: #2451b8;
+}
+
+.email-wrap {
+  background: #f4f5f7;
+}
+
+.email-masthead {
+  padding: 24px 0 8px;
+  font-size: 16px;
+  font-weight: 700;
+  color: #24292f;
+}
+
+.email-masthead img {
+  max-height: 40px;
+}
+
+.email-card {
+  background: #ffffff;
+  border: 1px solid #d7dbe0;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.email-brandbar {
+  height: 4px;
+  background: #2451b8;
+}
+
+.email-content-cell {
+  padding: 28px;
+}
+
+.email-heading {
+  margin: 0 0 14px;
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.25;
+  color: #14181f;
+}
+
+.email-lead {
+  margin: 0 0 14px;
+  font-size: 15px;
+  line-height: 1.6;
+  color: #24292f;
+}
+
+.email-dictionary {
+  margin: 0 0 16px;
+}
+
+.email-dict-label {
+  padding: 6px 12px 6px 0;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: #57606a;
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+.email-dict-value {
+  padding: 6px 0;
+  font-size: 15px;
+  line-height: 1.5;
+  color: #24292f;
+}
+
+.email-table {
+  margin: 0 0 16px;
+}
+
+.email-table th {
+  padding: 8px;
+  border-bottom: 1px solid #d7dbe0;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: #57606a;
+  text-align: left;
+}
+
+.email-table td {
+  padding: 10px 8px;
+  border-bottom: 1px solid #edf0f3;
+  font-size: 14px;
+  color: #24292f;
+}
+
+.email-button {
+  display: inline-block;
+  padding: 12px 28px;
+  border-radius: 6px;
+  background-color: #2451b8;
+  color: #ffffff !important;
+  font-size: 15px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.email-trouble {
+  margin: 12px 0 0;
+  font-size: 12px;
+  color: #808891;
+  word-break: break-all;
+}
+
+.email-invite-code {
+  display: inline-block;
+  margin: 8px 0;
+  padding: 14px 24px;
+  border-radius: 6px;
+  background: #f4f5f7;
+  font-family: Consolas, Monaco, monospace;
+  font-size: 22px;
+  letter-spacing: .2em;
+  color: #24292f;
+  text-align: center;
+}
+
+.email-outro {
+  margin: 0 0 14px;
+  font-size: 15px;
+  line-height: 1.6;
+  color: #24292f;
+}
+
+.email-signature {
+  margin: 0;
+  font-size: 15px;
+  color: #24292f;
+}
+
+.email-footer {
+  padding: 16px 0;
+  text-align: center;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #808891;
+}

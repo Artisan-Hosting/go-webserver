@@ -1,0 +1,10 @@
+/* Fixture theme used by TestThemeSwapIsRespectedAtStartup in
+   ../../mailtheme_test.go — deliberately distinct colors so the test can
+   assert the swap actually took effect. Not a real theme to ship. */
+
+body, html { background: #ffe6f2; color: #4a004a; font-family: Georgia, serif; }
+a { color: #d6008a; }
+.email-brandbar { height: 6px; background: #ff1493; }
+.email-card { background: #fff0f7; border: 2px solid #ff1493; border-radius: 20px; }
+.email-heading { color: #d6008a; }
+.email-footer { color: #a3006b; }

@@ -1,0 +1,13 @@
+# Build output (see makefile: `go build -o ./bin`)
+/server/bin
+/server/web_server
+
+# Per-deployment secrets/config — never commit a real one, see README.md
+/server/.env
+
+# Runtime state (old default preview-cache-dir; current default lives
+# under the OS temp dir instead, see server/preview.go)
+/server/cache/
+/cache/
+
+/.claude
