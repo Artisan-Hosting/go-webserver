@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"image"
 	_ "image/gif"
 	_ "image/jpeg"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,13 +23,26 @@ import (
 )
 
 const (
-	// maxImageWidth and maxImageHeight bound the dimensions that on-the-fly
-	// WebP conversions under /imgs/ are downscaled to.
+	// maxImageWidth and maxImageHeight are the default dimensions on-the-fly
+	// WebP conversions under /imgs/ are downscaled to when a request doesn't
+	// override them via the w/h query params (see parseImageRequestOptions).
 	maxImageWidth  = 512
 	maxImageHeight = 256
-	// webpQuality is the lossy encoding quality used for /imgs/ conversions.
+	// webpQuality is the default lossy encoding quality used for /imgs/
+	// conversions when a request doesn't supply a q query param.
 	webpQuality = 60
+	// minWebPQuality and maxWebPQuality clamp the q query param.
+	minWebPQuality = 30
+	maxWebPQuality = 95
 )
+
+// imageRequestOptions carries the resolved per-request resize/quality
+// settings for one /imgs/ conversion, derived from the w/h/q query params.
+type imageRequestOptions struct {
+	maxWidth  int
+	maxHeight int
+	quality   float32
+}
 
 // cachedWebP holds a previously converted WebP image plus the source file's
 // modification time, used to detect when the cached copy is stale.
@@ -95,7 +110,8 @@ func optimizedImageHandlerWithCache(staticDir string, fallback http.Handler, cac
 			return
 		}
 
-		key := fullPath
+		opts := parseImageRequestOptions(r)
+		key := fmt.Sprintf("%s|w=%d|h=%d|q=%0.1f", fullPath, opts.maxWidth, opts.maxHeight, opts.quality)
 
 		cache.RLock()
 		cached, ok := cache.items[key]
@@ -133,10 +149,10 @@ func optimizedImageHandlerWithCache(staticDir string, fallback http.Handler, cac
 			return
 		}
 
-		processed := resizeIfNeeded(img)
+		processed := resizeIfNeeded(img, opts.maxWidth, opts.maxHeight)
 
 		var buf bytes.Buffer
-		if err := webp.Encode(&buf, processed, &webp.Options{Quality: webpQuality}); err != nil {
+		if err := webp.Encode(&buf, processed, &webp.Options{Quality: opts.quality}); err != nil {
 			fallback.ServeHTTP(w, r)
 			return
 		}
@@ -170,10 +186,75 @@ func supportsWebP(r *http.Request) bool {
 	return strings.Contains(accept, "image/webp")
 }
 
-// resizeIfNeeded downscales src to fit within the standard /imgs/ bounds
-// (maxImageWidth x maxImageHeight), leaving it untouched if it already fits.
-func resizeIfNeeded(src image.Image) image.Image {
-	return resizeToFit(src, maxImageWidth, maxImageHeight)
+// parseImageRequestOptions resolves the w/h/q query params on an /imgs/
+// request into concrete resize/quality settings.
+//
+//   - If neither w nor h is given, both default to maxImageWidth/maxImageHeight.
+//   - If exactly one of w/h is given, the other is left unconstrained (-1)
+//     rather than defaulted, so e.g. "?w=1200" alone scales to exactly
+//     1200px wide at the source aspect ratio instead of being boxed into
+//     the default bounds.
+//   - q defaults to webpQuality and is clamped to [minWebPQuality, maxWebPQuality].
+//
+// Invalid or non-positive values are treated the same as absent ones.
+func parseImageRequestOptions(r *http.Request) imageRequestOptions {
+	maxWidth := parsePositiveInt(r.URL.Query().Get("w"))
+	maxHeight := parsePositiveInt(r.URL.Query().Get("h"))
+	quality := parsePositiveInt(r.URL.Query().Get("q"))
+
+	if maxWidth == 0 && maxHeight == 0 {
+		maxWidth = maxImageWidth
+		maxHeight = maxImageHeight
+	} else {
+		if maxWidth == 0 {
+			maxWidth = -1
+		}
+		if maxHeight == 0 {
+			maxHeight = -1
+		}
+	}
+
+	q := webpQuality
+	if quality > 0 {
+		switch {
+		case quality < minWebPQuality:
+			q = minWebPQuality
+		case quality > maxWebPQuality:
+			q = maxWebPQuality
+		default:
+			q = quality
+		}
+	}
+
+	return imageRequestOptions{maxWidth: maxWidth, maxHeight: maxHeight, quality: float32(q)}
+}
+
+// parsePositiveInt parses raw as a positive int, returning 0 for anything
+// empty, malformed, or non-positive so callers can treat it as "unset".
+func parsePositiveInt(raw string) int {
+	if raw == "" {
+		return 0
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	return value
+}
+
+// resizeIfNeeded downscales src to fit within maxWidth x maxHeight, leaving
+// it untouched if it already fits. A maxWidth or maxHeight below 1 (the
+// sentinel parseImageRequestOptions produces for an unconstrained axis) is
+// resolved to src's own dimension on that axis, i.e. no constraint.
+func resizeIfNeeded(src image.Image, maxWidth, maxHeight int) image.Image {
+	bounds := src.Bounds()
+	if maxWidth < 1 {
+		maxWidth = bounds.Dx()
+	}
+	if maxHeight < 1 {
+		maxHeight = bounds.Dy()
+	}
+	return resizeToFit(src, maxWidth, maxHeight)
 }
 
 // resizeToFit downscales src, preserving aspect ratio, so that it fits
