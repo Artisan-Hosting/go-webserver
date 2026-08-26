@@ -25,6 +25,7 @@ func testStatusConfig() statusConfig {
 			{target: "https://cloud.artisanhosting.net/status.php", name: "Cloud Storage"},
 		},
 		degradedWindow: defaultDegradedWindow,
+		recoveryWindow: defaultRecoveryWindow,
 		missRatio:      defaultDegradedMissRatio,
 		dayMissRatio:   defaultDayMissMinutes / minutesPerDay,
 		dayOutageRatio: defaultDayOutageMinutes / minutesPerDay,
@@ -45,6 +46,7 @@ func currentFor(target string, up, total, latencySeconds, httpStatus float64) []
 		instantSeries(map[string]string{"target": target, "agg": "up"}, up),
 		instantSeries(map[string]string{"target": target, "agg": "total"}, total),
 		instantSeries(map[string]string{"target": target, "agg": "latency"}, latencySeconds),
+		instantSeries(map[string]string{"target": target, "agg": "latency_avg"}, latencySeconds),
 		instantSeries(map[string]string{"target": target, "agg": "http"}, httpStatus),
 		instantSeries(map[string]string{"target": target, "agg": "checked"}, float64(fixedNow.Add(-15*time.Second).Unix())),
 	}...)
@@ -53,7 +55,12 @@ func currentFor(target string, up, total, latencySeconds, httpStatus float64) []
 // missFor produces the sustained missed-check aggregates: the worst rate at any
 // single location, and how many locations are over the threshold.
 func missFor(target string, rate float64, locations int) []promSeries {
-	series := []promSeries{instantSeries(map[string]string{"target": target, "agg": "miss"}, rate)}
+	series := []promSeries{
+		instantSeries(map[string]string{"target": target, "agg": "miss"}, rate),
+		// Fixtures describe a fault that is still happening unless a test says
+		// otherwise; see withRecovered.
+		instantSeries(map[string]string{"target": target, "agg": "recent"}, rate),
+	}
 	if locations > 0 {
 		series = append(series, instantSeries(map[string]string{"target": target, "agg": "miss_locs"}, float64(locations)))
 	}
@@ -691,7 +698,7 @@ func historyPoint(target, agg string, at time.Time, value float64) promSeries {
 func withMiss(current []promSeries, target string, rate float64, locations int) []promSeries {
 	kept := current[:0:0]
 	for _, series := range current {
-		if agg := series.Metric["agg"]; agg == "miss" || agg == "miss_locs" {
+		if agg := series.Metric["agg"]; agg == "miss" || agg == "miss_locs" || agg == "recent" {
 			continue
 		}
 		kept = append(kept, series)
@@ -902,5 +909,111 @@ func TestStatusHistoryQueryMeasuresOverlapDirectly(t *testing.T) {
 	}
 	if !strings.Contains(query, "[1d:"+dayOutageResolution+"]") {
 		t.Errorf("subquery resolution missing: %s", query)
+	}
+}
+
+// withRecovered says the trailing hour still carries the fault but nothing has
+// missed a check lately -- the shape of a service that has just recovered.
+func withRecovered(current []promSeries, target string) []promSeries {
+	out := current[:0:0]
+	for _, series := range current {
+		if series.Metric["agg"] == "recent" {
+			continue
+		}
+		out = append(out, series)
+	}
+	return append(out, instantSeries(map[string]string{"target": target, "agg": "recent"}, 0))
+}
+
+func TestDeriveStatusStateClearsOnceTheFaultStops(t *testing.T) {
+	cfg := testStatusConfig()
+	cfg.targets = cfg.targets[:1]
+	target := "https://www.artisanhosting.net"
+
+	// The hour still remembers a 12% miss rate, but nothing has failed
+	// recently. Waiting for the window to drain kept the badge lit for up to
+	// an hour after the service was fine.
+	current := withRecovered(withMiss(currentFor(target, 2, 2, 0.1, 200), target, 0.12, 1), target)
+	snapshot, _ := buildStatusSnapshot(cfg, current, nil, nil, fixedNow, fixedNow)
+
+	if got := snapshot.Services[0].State; got != statusOK {
+		t.Errorf("state = %q, want %q once the fault stops", got, statusOK)
+	}
+}
+
+func TestDeriveStatusStateStaysDegradedWhileTheFaultContinues(t *testing.T) {
+	cfg := testStatusConfig()
+	cfg.targets = cfg.targets[:1]
+	target := "https://www.artisanhosting.net"
+
+	// Still missing checks inside the recovery window: the recency gate must
+	// not let an ongoing fault clear early.
+	current := withMiss(currentFor(target, 2, 2, 0.1, 200), target, 0.12, 1)
+	snapshot, _ := buildStatusSnapshot(cfg, current, nil, nil, fixedNow, fixedNow)
+
+	if got := snapshot.Services[0].State; got != statusWarn {
+		t.Errorf("state = %q, want %q while checks are still being missed", got, statusWarn)
+	}
+}
+
+func TestDeriveStatusStateRecencyAloneIsNotEnough(t *testing.T) {
+	cfg := testStatusConfig()
+	cfg.targets = cfg.targets[:1]
+	target := "https://www.artisanhosting.net"
+
+	// A blip just now, with a clean hour behind it. The recency gate speeds up
+	// recovery; it must not become a second way to raise an alarm.
+	current := withMiss(currentFor(target, 2, 2, 0.1, 200), target, 0.008, 0)
+	snapshot, _ := buildStatusSnapshot(cfg, current, nil, nil, fixedNow, fixedNow)
+
+	if got := snapshot.Services[0].State; got != statusOK {
+		t.Errorf("state = %q, want %q: a recent blip is not sustained evidence", got, statusOK)
+	}
+}
+
+func TestStatusCurrentQueryAsksForRecentMisses(t *testing.T) {
+	cfg := testStatusConfig()
+	cfg.recoveryWindow = "3m"
+	query := statusCurrentQuery(cfg)
+	if !strings.Contains(query, "[3m]") {
+		t.Errorf("query ignores the configured recovery window: %s", query)
+	}
+}
+
+func TestDeriveStatusStateLatencyJudgedOnTheWindowNotTheInstant(t *testing.T) {
+	cfg := testStatusConfig()
+	cfg.degradedMS = 250
+	cfg.targets = cfg.targets[:1]
+	target := "https://www.artisanhosting.net"
+
+	// A single slow scrape against a service that averages well under the
+	// threshold. Round-trip times wander; reacting to one sample made services
+	// near the line flip continuously.
+	current := currentFor(target, 2, 2, 0.280, 200)
+	for i := range current {
+		if current[i].Metric["agg"] == "latency_avg" {
+			current[i] = instantSeries(map[string]string{"target": target, "agg": "latency_avg"}, 0.190)
+		}
+	}
+	snapshot, _ := buildStatusSnapshot(cfg, current, nil, nil, fixedNow, fixedNow)
+	service := snapshot.Services[0]
+
+	if service.State != statusOK {
+		t.Errorf("state = %q, want %q: one slow sample is not a slow service", service.State, statusOK)
+	}
+	// The page still shows what the last check actually took.
+	if service.LatencyMS != 280 {
+		t.Errorf("displayed latency = %d ms, want the current 280", service.LatencyMS)
+	}
+
+	// Sustained slowness does still flag.
+	for i := range current {
+		if current[i].Metric["agg"] == "latency_avg" {
+			current[i] = instantSeries(map[string]string{"target": target, "agg": "latency_avg"}, 0.310)
+		}
+	}
+	snapshot, _ = buildStatusSnapshot(cfg, current, nil, nil, fixedNow, fixedNow)
+	if got := snapshot.Services[0].State; got != statusWarn {
+		t.Errorf("state = %q, want %q when the window average is over the threshold", got, statusWarn)
 	}
 }

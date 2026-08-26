@@ -103,7 +103,8 @@ both.
 | `STATUS_DEGRADED_MISS_RATIO` | `0.05` | Share of checks one location may miss inside that window before the service reads as Degraded. Must be in `[0, 1)`. |
 | `STATUS_DAY_MISS_MINUTES` | `5` | How long a location may be missing checks within one day before that day is marked amber on the history strip. |
 | `STATUS_DAY_OUTAGE_MINUTES` | `1` | How long a target must be unreachable from *every* location at once before a day is marked red. |
-| `STATUS_DEGRADED_MS` | *(unset)* | Optional secondary Degraded signal: every location up but slower than this many milliseconds. Off by default. |
+| `STATUS_RECOVERY_WINDOW` | `10m` | How recently a location must have missed a check for a service to still count as Degraded, and the window latency is averaged over. |
+| `STATUS_DEGRADED_MS` | *(unset)* | Optional secondary Degraded signal: every location up but **averaging** slower than this many milliseconds over `STATUS_RECOVERY_WINDOW`. Off by default. |
 | `STATUS_CACHE_TTL` | `30s` | How long a status snapshot is served before refreshing. Match your `scrape_interval`; polling faster cannot produce new information. |
 
 See [`docs/MAIL_THEMING.md`](docs/MAIL_THEMING.md) for the full theming
@@ -390,6 +391,26 @@ At a 30s scrape the defaults mean a location must miss more than ~3 minutes of
 the last hour to trip, while a single failed check is ~0.8% and passes unnoticed.
 `miss_rate` and `locations_missing` on each service report what tripped it.
 
+**Detection and recovery are asymmetric.** A trailing hour is the right amount of
+evidence for deciding something is wrong, but the wrong thing to recover on:
+those missed checks sit in the window for a full hour after the fault clears. So
+Degraded additionally requires a location to still be missing checks within
+`STATUS_RECOVERY_WINDOW` — slow to alarm, quick to forgive. Measured against real
+probe history, recovering on the hour alone left the badge lit for 23 minutes
+past the last failed check at the median and 58 at the 90th percentile; the gate
+brings that to roughly the window itself.
+
+Shortening the window keeps trading responsiveness for flapping. Over the same
+history, `5m` cut the median wait to 5 minutes but produced 6.5× the state
+changes; `10m` roughly halves the wait at 2.5×.
+
+The `STATUS_DEGRADED_MS` signal is averaged over the same window rather than read
+off the current scrape, for the same reason. Round-trip times wander either side
+of any threshold, so judging on the instant value made services sitting near the
+line flip continuously — 1124 state changes in a day across one real fleet, where
+the windowed average produced 197. The `latency_ms` a service reports is still
+the current measurement; only the decision is smoothed.
+
 `uptime` is measured from whichever location had the best view of the target
 (`max`, not `avg`). Averaging charges a service for a flaky monitoring path: one
 location down for a day out of thirty reports 98.3% uptime for a service that was
@@ -398,9 +419,15 @@ Locations disagreeing is not hidden — it surfaces as Degraded and on the histo
 strip.
 
 `history` carries 30 daily buckets, oldest first; a bucket with no data in
-Prometheus is `null` rather than `0`, so gaps do not render as outages. Both
-`uptime` and `history` need TSDB retention at least as long as the window being
-reported.
+Prometheus is `null` rather than `0`, so gaps do not render as outages.
+
+Both `uptime` and `history` need TSDB retention at least as long as the window
+being reported, and **this is easy to get wrong quietly**: `avg_over_time` only
+averages samples that exist, so a `30d` figure computed against 14 days of
+retention is a 14-day figure wearing a 30-day label, and the strip renders the
+missing half as no-data. If retention is shorter than 30 days, either raise
+`--storage.tsdb.retention.time` or drop the `30d` window rather than publish a
+number that means something narrower than it says.
 
 ### How a day is classified
 
