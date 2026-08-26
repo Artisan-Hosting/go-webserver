@@ -115,7 +115,8 @@ system and how to add a per-site theme.
 |---|---|---|
 | `GET /` | `htmlPreviewRewriteHandler` | Serves the static site; rewrites `<img>` preview tags in HTML responses. |
 | `GET /imgs/*` | `optimizedImageHandler` | Serves images, converting to WebP on the fly when the client supports it. |
-| `GET /__preview/*` | `previewImageHandler` | Serves cached server-side link-preview screenshots, falling back to the Artisan Studios lockup. See [Link previews](#link-previews). |
+| `GET /__preview/<hash>.webp` | `previewImageHandler` | Serves a cached link-preview screenshot, falling back to the Artisan Studios lockup. See [Link previews](#link-previews). |
+| `GET /__preview/<hash>.json` | `previewImageHandler` | Reports whether that screenshot is `ready`, `pending`, or `unavailable`, so the page can swap it in without a reload. |
 | `POST /api/contact` | `contactHandler` | Contact form submission: validates captcha (if enabled), emails submitter + owner. |
 | `GET /api/captcha-config` | `captchaConfigHandler` | Public captcha config (enabled flag + endpoint) for the frontend widget. |
 | `GET /api/status` | `statusHandlerWithDependencies` | Public service status derived from blackbox_exporter probes in Prometheus. See [Service status](#service-status). |
@@ -179,6 +180,17 @@ that page does not silently disable the check; if the service can't be
 reached at all, the reference stays unlearned and the check simply goes
 inert.
 
+**Stabilising a flaky capture.** The screenshot service caches its own
+captures, and it caches bad ones just as happily as good ones. Measured
+against a page that photographs blank: the plain URL returns an identical
+5,402-byte blank however long a `wait` is requested, and stays blank with a
+cache-busting nonce alone — only a nonce *and* a wait produce the real 178KB
+page. So a capture rejected by either screen is retried once against
+`wait/6/…/<url>?preview=<nonce>`, which forces a fresh render that lets the
+page's JavaScript paint. That retry costs ~8s and a real page load for the
+site being photographed, so it is reserved for a capture that already came
+back unusable rather than run on the common path.
+
 **Falling back.** A target that fails any of these checks is recorded as
 unavailable, and the HTML rewrite points its `<img>` at the Artisan Studios
 lockup instead, tagged `data-preview-state="placeholder"` and
@@ -188,6 +200,26 @@ page is already open redirects to the same lockup, picking light or dark
 from the `Sec-CH-Prefers-Color-Scheme` client hint (requested via `Accept-CH`
 on HTML responses) and defaulting to the light-theme artwork. Nothing ever
 resolves to a 404.
+
+**Nothing waits on the screenshot service.** A request is never held open
+for a capture. `renderMode` decides each `<img>` as the HTML is written:
+
+| State | What the tag gets |
+|---|---|
+| A validated capture is cached | `src="/__preview/<hash>.webp"`, served off our own disk |
+| Nothing cached yet | The lockup as `src`, plus `data-preview-src` and `data-preview-status`; the same request starts the capture in the background |
+| Target failed screening | The lockup, and no swap addresses — nothing is coming |
+
+For a pending card, `include.js` polls `/__preview/<hash>.json` on a backoff
+(1.5s, 3s, 5s, 8s, 12s, 20s, 30s, then it stops and leaves the next page load
+to sort it out) and swaps the screenshot in when the state turns `ready`. It
+drops `data-theme-logo` as it swaps, or the theme swap would put the lockup
+back on the visitor's next theme change. Captures are single-flighted per
+target, so six uncaptured cards on one page ask the service for six pictures,
+not six per visitor.
+
+A known-bad target shows the placeholder even when an older capture is still
+cached: a site that is down should not be shown as though it were up.
 
 **Cache lifecycle.**
 

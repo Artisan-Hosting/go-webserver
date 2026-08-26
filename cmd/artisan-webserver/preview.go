@@ -17,6 +17,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +45,10 @@ const (
 	// previewUserAgent identifies our outbound preview requests, both to
 	// the screenshot service and to the origins we screen.
 	previewUserAgent = "artisan-studio-preview/1.0"
+	// previewRenderWaitSeconds is how long the screenshot service is asked
+	// to let a page paint before photographing it. Client-rendered pages
+	// come back blank without it.
+	previewRenderWaitSeconds = 6
 )
 
 // Origin screening. A screenshot is only worth taking of a page that is
@@ -161,6 +166,8 @@ type previewState struct {
 	sources    map[string]string
 	statusMu   sync.RWMutex
 	statuses   map[string]previewAvailability
+	inflightMu sync.Mutex
+	inflight   map[string]struct{}
 }
 
 func newPreviewState() *previewState {
@@ -168,6 +175,7 @@ func newPreviewState() *previewState {
 		cacheItems: make(map[string]previewCacheEntry),
 		sources:    make(map[string]string),
 		statuses:   make(map[string]previewAvailability),
+		inflight:   make(map[string]struct{}),
 	}
 }
 
@@ -190,10 +198,7 @@ var imgSrcAttrRE = regexp.MustCompile(`(?i)\s+src="[^"]*"`)
 // point at the local /__preview/ proxy (see rewriteServerPreviewSources).
 // Non-HTML requests, or requests for files that can't be resolved to an
 // HTML file under staticDir, fall back to the provided fallback handler.
-func htmlPreviewRewriteHandler(staticDir string, fallback http.Handler, buildHash func() string, state *previewState) http.HandlerFunc {
-	if state == nil {
-		state = defaultPreviewState
-	}
+func htmlPreviewRewriteHandler(staticDir string, fallback http.Handler, buildHash func() string, renderMode func(string) previewRenderMode) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			fallback.ServeHTTP(w, r)
@@ -212,7 +217,7 @@ func htmlPreviewRewriteHandler(staticDir string, fallback http.Handler, buildHas
 			return
 		}
 
-		rewritten := rewriteServerPreviewSources(src, buildHash(), state.isUnavailable)
+		rewritten := rewriteServerPreviewSources(src, buildHash(), renderMode)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
 		// Asking for the color-scheme hint here is what lets a preview that
@@ -269,14 +274,16 @@ func resolveHTMLPath(staticDir, requestPath string) (string, os.FileInfo, bool) 
 // mixed into the cache key so that a site rebuild produces fresh preview
 // URLs.
 //
-// Targets that unavailable reports as known-bad are instead pointed at the
-// Artisan Studios lockup, marked so CSS can letterbox it and so
-// include.js's theme swap picks the light or dark artwork. Targets with no
-// verdict yet stay optimistic and resolve through /__preview/, which falls
-// back to the same placeholder if the capture fails.
-func rewriteServerPreviewSources(src []byte, buildHash string, unavailable func(string) bool) []byte {
-	if unavailable == nil {
-		unavailable = func(string) bool { return false }
+// Only a target with a capture already cached is pointed at /__preview/.
+// Everything else gets the lockup as its src — marked so CSS letterboxes it
+// and include.js's theme swap picks the light or dark artwork — because a
+// tag that resolves instantly from our own disk is worth more to the page
+// than one that waits on a screenshot service. A target still being captured
+// also carries the addresses the page needs to swap the real screenshot in
+// when it lands.
+func rewriteServerPreviewSources(src []byte, buildHash string, renderMode func(string) previewRenderMode) []byte {
+	if renderMode == nil {
+		renderMode = func(string) previewRenderMode { return previewRenderReady }
 	}
 	return serverPreviewImgTagRE.ReplaceAllFunc(src, func(tag []byte) []byte {
 		matches := serverPreviewImgTagRE.FindSubmatch(tag)
@@ -290,14 +297,23 @@ func rewriteServerPreviewSources(src []byte, buildHash string, unavailable func(
 		}
 
 		updatedTag := string(tag)
-		if unavailable(target) {
+		hash := previewCacheKey(target, buildHash)
+		switch renderMode(target) {
+		case previewRenderReady:
+			updatedTag = setOrInsertImgSrc(updatedTag, fmt.Sprintf("/__preview/%s.webp", hash))
+			updatedTag = insertImgAttribute(updatedTag, "data-preview-state", `data-preview-state="live"`)
+		case previewRenderPending:
 			updatedTag = setOrInsertImgSrc(updatedTag, previewPlaceholderLightSrc)
 			updatedTag = insertImgAttribute(updatedTag, "data-preview-state", `data-preview-state="placeholder"`)
 			updatedTag = insertImgAttribute(updatedTag, "data-theme-logo", "data-theme-logo")
-		} else {
-			hash := previewCacheKey(target, buildHash)
-			updatedTag = setOrInsertImgSrc(updatedTag, fmt.Sprintf("/__preview/%s.webp", hash))
-			updatedTag = insertImgAttribute(updatedTag, "data-preview-state", `data-preview-state="live"`)
+			updatedTag = insertImgAttribute(updatedTag, "data-preview-src",
+				fmt.Sprintf(`data-preview-src="/__preview/%s.webp"`, hash))
+			updatedTag = insertImgAttribute(updatedTag, "data-preview-status",
+				fmt.Sprintf(`data-preview-status="/__preview/%s.json"`, hash))
+		default:
+			updatedTag = setOrInsertImgSrc(updatedTag, previewPlaceholderLightSrc)
+			updatedTag = insertImgAttribute(updatedTag, "data-preview-state", `data-preview-state="placeholder"`)
+			updatedTag = insertImgAttribute(updatedTag, "data-theme-logo", "data-theme-logo")
 		}
 		updatedTag = insertImgAttribute(updatedTag, "data-preview-origin", `data-preview-origin="server"`)
 		return []byte(updatedTag)
@@ -497,6 +513,98 @@ func (state *previewState) availability(targetURL string) (previewAvailability, 
 	return status, ok
 }
 
+// previewRenderMode says how a preview <img> should be written into the HTML
+// being served right now.
+type previewRenderMode int
+
+const (
+	// previewRenderReady: a validated screenshot is cached, so the tag can
+	// point straight at it.
+	previewRenderReady previewRenderMode = iota
+	// previewRenderPending: nothing cached yet. The tag gets the lockup and
+	// the addresses it needs to swap the screenshot in once the capture
+	// lands. Holding the response open for a screenshot service instead
+	// would put seconds of someone else's infrastructure on our page load.
+	previewRenderPending
+	// previewRenderUnavailable: the target failed screening. The lockup is
+	// the final answer until the warmer finds it healthy again.
+	previewRenderUnavailable
+)
+
+// renderMode decides how targetURL should be rendered. A known-bad target
+// gets the placeholder even when an older capture is still cached: a site
+// that is down should not be shown as though it were up.
+func (state *previewState) renderMode(cacheDir, targetURL string) previewRenderMode {
+	if state.isUnavailable(targetURL) {
+		return previewRenderUnavailable
+	}
+	if _, ok := state.cachedPreview(cacheDir, targetURL); ok {
+		return previewRenderReady
+	}
+	return previewRenderPending
+}
+
+// cachedPreview returns a fresh cached capture for targetURL from memory or
+// disk, promoting a disk hit into memory on the way past.
+func (state *previewState) cachedPreview(cacheDir, targetURL string) ([]byte, bool) {
+	objectKey := previewObjectKey(targetURL)
+	if data, ok := state.getFreshFromMemory(objectKey); ok {
+		return data, true
+	}
+	if cacheDir == "" {
+		return nil, false
+	}
+	diskPath := filepath.Join(cacheDir, objectKey+".webp")
+	if data, _, ok := getFreshPreviewFromDisk(diskPath, previewTTL); ok {
+		state.storeInMemory(objectKey, data)
+		return data, true
+	}
+	return nil, false
+}
+
+// beginCapture claims the right to capture targetURL, reporting false if
+// another capture for it is already running. Without this, a page with six
+// uncaptured cards would ask the screenshot service for the same picture
+// once per visitor.
+func (state *previewState) beginCapture(targetURL string) bool {
+	state.inflightMu.Lock()
+	defer state.inflightMu.Unlock()
+	if state.inflight == nil {
+		state.inflight = make(map[string]struct{})
+	}
+	if _, running := state.inflight[targetURL]; running {
+		return false
+	}
+	state.inflight[targetURL] = struct{}{}
+	return true
+}
+
+// endCapture releases the claim taken by beginCapture.
+func (state *previewState) endCapture(targetURL string) {
+	state.inflightMu.Lock()
+	delete(state.inflight, targetURL)
+	state.inflightMu.Unlock()
+}
+
+// captureInBackground starts a capture for targetURL and returns
+// immediately, so no visitor's request ever waits on a screenshot service.
+func (state *previewState) captureInBackground(
+	client *http.Client,
+	probe func(*http.Client, string) error,
+	fetch func(*http.Client, string) ([]byte, error),
+	cacheDir, targetURL string,
+) {
+	if !state.beginCapture(targetURL) {
+		return
+	}
+	go func() {
+		defer state.endCapture(targetURL)
+		if _, err := state.capturePreview(client, probe, fetch, cacheDir, targetURL); err != nil {
+			log.Printf("preview: background capture of %s failed: %v", targetURL, err)
+		}
+	}()
+}
+
 // isUnavailable reports whether targetURL is known-bad. A target that has
 // never been screened is not treated as unavailable: the /__preview/
 // endpoint will screen it on demand and fall back if it has to.
@@ -505,13 +613,12 @@ func (state *previewState) isUnavailable(targetURL string) bool {
 	return ok && !status.ok
 }
 
-// previewImageHandler returns an http.HandlerFunc serving
-// /__preview/<hash>.webp requests. It resolves the hash to a target URL via
-// sourceForHash, then serves the corresponding preview image from the
-// in-memory cache, the on-disk cache, or by screening the origin and
-// capturing it fresh (in that order of preference), persisting newly
-// captured images to both caches. If the origin is unhealthy or its capture
-// is unusable, it redirects to the Artisan Studios lockup placeholder.
+// previewImageHandler returns an http.HandlerFunc serving the /__preview/
+// endpoints: <hash>.webp for the image itself and <hash>.json for its
+// state. It resolves the hash to a target URL via sourceForHash and answers
+// from cache. A miss never blocks — the capture starts in the background and
+// the request is answered immediately, with the lockup placeholder for the
+// image and a "pending" verdict for the status.
 func previewImageHandler(cacheDir string, sourceForHash func(string) (string, bool)) http.HandlerFunc {
 	return previewImageHandlerWithDependencies(
 		cacheDir,
@@ -553,8 +660,9 @@ func previewImageHandlerWithStateDependencies(
 			return
 		}
 
-		hashPart := strings.TrimPrefix(path.Clean(r.URL.Path), "/__preview/")
-		hashPart = strings.TrimSuffix(hashPart, ".webp")
+		requested := strings.TrimPrefix(path.Clean(r.URL.Path), "/__preview/")
+		statusRequest := strings.HasSuffix(requested, ".json")
+		hashPart := strings.TrimSuffix(strings.TrimSuffix(requested, ".json"), ".webp")
 		if hashPart == "" || len(hashPart) < 16 {
 			http.Error(w, "invalid preview key", http.StatusBadRequest)
 			return
@@ -566,30 +674,46 @@ func previewImageHandlerWithStateDependencies(
 			return
 		}
 
-		objectKey := previewObjectKey(targetURL)
-
-		if data, ok := state.getFreshFromMemory(objectKey); ok {
-			log.Printf("preview cache: memory hit for %s", targetURL)
+		if data, cached := state.cachedPreview(cacheDir, targetURL); cached {
+			if statusRequest {
+				writePreviewStatus(w, "ready", fmt.Sprintf("/__preview/%s.webp", hashPart))
+				return
+			}
 			servePreviewWebP(w, r, hashPart, now(), data, previewBrowserTTL)
 			return
 		}
 
-		diskPath := filepath.Join(cacheDir, objectKey+".webp")
-		if data, modTime, ok := getFreshPreviewFromDisk(diskPath, previewTTL); ok {
-			log.Printf("preview cache: disk hit for %s (%s)", targetURL, diskPath)
-			state.storeInMemory(objectKey, data)
-			servePreviewWebP(w, r, hashPart, modTime, data, previewBrowserTTL)
-			return
-		}
-
-		log.Printf("preview cache: miss for %s, capturing fresh copy", targetURL)
-		data, captureErr := state.capturePreview(client, probe, fetch, cacheDir, targetURL)
-		if captureErr != nil {
+		if state.isUnavailable(targetURL) {
+			if statusRequest {
+				writePreviewStatus(w, "unavailable", "")
+				return
+			}
 			servePreviewPlaceholder(w, r)
 			return
 		}
-		servePreviewWebP(w, r, hashPart, now(), data, previewBrowserTTL)
+
+		// Nothing cached: start the capture and answer now. The page is
+		// already showing the lockup and will swap the screenshot in.
+		state.captureInBackground(client, probe, fetch, cacheDir, targetURL)
+		if statusRequest {
+			writePreviewStatus(w, "pending", "")
+			return
+		}
+		servePreviewPlaceholder(w, r)
 	}
+}
+
+// writePreviewStatus answers a /__preview/<hash>.json request. The response
+// is never cached: its whole purpose is to report a state that is about to
+// change.
+func writePreviewStatus(w http.ResponseWriter, state, src string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	body := fmt.Sprintf(`{"state":%q}`, state)
+	if src != "" {
+		body = fmt.Sprintf(`{"state":%q,"src":%q}`, state, src)
+	}
+	_, _ = io.WriteString(w, body)
 }
 
 // capturePreview screens targetURL's origin and, only if it answers like a
@@ -693,13 +817,49 @@ func probePreviewTargetOnce(client *http.Client, targetURL string) (bool, error)
 }
 
 // previewCaptureEndpoints lists the screenshot-service URLs tried for a
-// target, in order: a cropped full-page capture first, the page's Open Graph
-// image as a fallback.
-func previewCaptureEndpoints(targetURL string) []string {
-	return []string{
+// target, in the order they are attempted:
+//
+//  1. The plain capture, which the service serves from its own cache. Fast,
+//     free, and right most of the time.
+//  2. A forced fresh render that waits for the page to paint. The wait is
+//     what rescues a client-rendered page the service otherwise photographs
+//     before its JavaScript runs; the nonce is what gets past the service's
+//     cache, which is the part that actually matters. Measured against a
+//     page that captures blank: the plain URL returns an identical
+//     5,402-byte blank however long a wait is requested, and stays blank
+//     with a nonce alone — only nonce and wait together produce the real
+//     178KB page. Reserving this for a capture that already came back
+//     unusable keeps the cost (~8s, and a real page load for the site being
+//     photographed) off the common path.
+//  3. The page's Open Graph image, if it has one.
+//
+// An empty nonce omits step 2, which is what the sentinel lookup wants.
+func previewCaptureEndpoints(targetURL, nonce string) []string {
+	endpoints := []string{
 		fmt.Sprintf("https://image.thum.io/get/width/1200/crop/760/noanimate/%s", targetURL),
-		fmt.Sprintf("https://image.thum.io/get/ogImage/%s", targetURL),
 	}
+	if nonce != "" {
+		endpoints = append(endpoints, fmt.Sprintf(
+			"https://image.thum.io/get/wait/%d/width/1200/crop/760/noanimate/%s",
+			previewRenderWaitSeconds, previewNoncedURL(targetURL, nonce)))
+	}
+	return append(endpoints, fmt.Sprintf("https://image.thum.io/get/ogImage/%s", targetURL))
+}
+
+// previewNoncedURL appends a throwaway query parameter to targetURL so the
+// screenshot service treats it as a page it has not photographed before.
+func previewNoncedURL(targetURL, nonce string) string {
+	separator := "?"
+	if strings.Contains(targetURL, "?") {
+		separator = "&"
+	}
+	return targetURL + separator + "preview=" + nonce
+}
+
+// previewNonce produces the cache-busting value. It is a variable so tests
+// can make capture endpoints predictable.
+var previewNonce = func() string {
+	return strconv.FormatInt(time.Now().UnixNano(), 36)
 }
 
 // fetchPreviewImage retrieves a screenshot/preview of targetURL from the
@@ -710,7 +870,7 @@ func previewCaptureEndpoints(targetURL string) []string {
 // Either way the caller falls back to the placeholder.
 func fetchPreviewImage(client *http.Client, targetURL string) ([]byte, error) {
 	rejected := ""
-	for _, endpoint := range previewCaptureEndpoints(targetURL) {
+	for _, endpoint := range previewCaptureEndpoints(targetURL, previewNonce()) {
 		img, err := fetchCaptureImage(client, endpoint)
 		if err != nil {
 			continue
@@ -800,7 +960,7 @@ func (ref *previewErrorReference) ensure(client *http.Client) {
 		return
 	}
 
-	img, err := fetchCaptureImage(client, previewCaptureEndpoints(previewSentinelURL)[0])
+	img, err := fetchCaptureImage(client, previewCaptureEndpoints(previewSentinelURL, "")[0])
 	if err != nil {
 		log.Printf("preview: could not learn the unreachable-site capture: %v", err)
 		return
@@ -975,18 +1135,16 @@ func (warmer *previewWarmer) warmAll(ctx context.Context) {
 // warmOne captures target unless a fresh capture is already cached and the
 // target's last verdict was healthy.
 func (warmer *previewWarmer) warmOne(target string) {
-	objectKey := previewObjectKey(target)
 	status, screened := warmer.state.availability(target)
 	if screened && status.ok {
-		if _, cached := warmer.state.getFreshFromMemory(objectKey); cached {
-			return
-		}
-		diskPath := filepath.Join(warmer.cacheDir, objectKey+".webp")
-		if data, _, cached := getFreshPreviewFromDisk(diskPath, previewTTL); cached {
-			warmer.state.storeInMemory(objectKey, data)
+		if _, cached := warmer.state.cachedPreview(warmer.cacheDir, target); cached {
 			return
 		}
 	}
+	if !warmer.state.beginCapture(target) {
+		return
+	}
+	defer warmer.state.endCapture(target)
 	if _, err := warmer.state.capturePreview(warmer.client, warmer.probe, warmer.fetch, warmer.cacheDir, target); err == nil {
 		log.Printf("preview warm: captured %s", target)
 	}
