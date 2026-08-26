@@ -115,7 +115,7 @@ system and how to add a per-site theme.
 |---|---|---|
 | `GET /` | `htmlPreviewRewriteHandler` | Serves the static site; rewrites `<img>` preview tags in HTML responses. |
 | `GET /imgs/*` | `optimizedImageHandler` | Serves images, converting to WebP on the fly when the client supports it. |
-| `GET /__preview/*` | `previewImageHandler` | Serves cached server-side link-preview images. |
+| `GET /__preview/*` | `previewImageHandler` | Serves cached server-side link-preview screenshots, falling back to the Artisan Studios lockup. See [Link previews](#link-previews). |
 | `POST /api/contact` | `contactHandler` | Contact form submission: validates captcha (if enabled), emails submitter + owner. |
 | `GET /api/captcha-config` | `captchaConfigHandler` | Public captcha config (enabled flag + endpoint) for the frontend widget. |
 | `GET /api/status` | `statusHandlerWithDependencies` | Public service status derived from blackbox_exporter probes in Prometheus. See [Service status](#service-status). |
@@ -143,6 +143,64 @@ requested images stay cached indefinitely; an entry nobody has requested in
 reconverted. A background sweep also runs every 24h to actively evict idle
 entries, so long-running deployments don't accumulate an unbounded number of
 cached size/quality variants over months of uptime.
+
+## Link previews
+
+An `<img data-server-preview-url="https://example.com">` in the static site
+is rewritten on the way out and backed by a screenshot this server captures
+and caches itself, rather than a hotlink to a third-party service.
+
+**Screening.** A screenshot is only taken of a page that is actually serving
+a page. Before capturing, `probePreviewTarget` fetches the origin and
+requires an HTTP `200`, an HTML content type, and a body of at least 512
+bytes. A failure that could be the network rather than the site — a dropped
+connection, a timeout, a 5xx — is retried once before the target is written
+off, because demoting a healthy client site to a placeholder over one
+dropped connection is worse than the stale screenshot this screening exists
+to prevent. After capturing, `previewImageIsBlank` samples the image on a 64×64
+grid and rejects it if ≥99.5% of the samples are one flat color — which is
+what a client-rendered page looks like when the capture beats its JavaScript
+to the paint. Both checks exist because the failure they prevent is
+self-perpetuating: a captured 502 page, or a captured blank frame, stays on
+the site until the cache turns over.
+
+**Unreachable-capture screening.** When the screenshot service itself cannot
+reach a site, it returns a picture of its browser's "This site can't be
+reached" page — a real image of a real page, which neither the origin probe
+(the site answers us fine) nor the blank check rejects. So the server learns
+what that failure looks like: once per warm pass it asks the service for
+`unreachable.artisan-preview-sentinel.invalid`, a host that can never
+resolve, and fingerprints the result with a 64-bit difference hash. Any
+capture within `previewErrorCaptureDistance` (6 bits) of that reference is
+discarded. Measured against live captures, two error pages naming different
+URLs hash 0–3 bits apart while the nearest genuine screenshot sits 11 bits
+away. Learning the reference instead of hard-coding it means a restyle of
+that page does not silently disable the check; if the service can't be
+reached at all, the reference stays unlearned and the check simply goes
+inert.
+
+**Falling back.** A target that fails any of these checks is recorded as
+unavailable, and the HTML rewrite points its `<img>` at the Artisan Studios
+lockup instead, tagged `data-preview-state="placeholder"` and
+`data-theme-logo` so the site CSS letterboxes it and `include.js` swaps the
+light/dark artwork with the visitor's theme. A capture that fails while a
+page is already open redirects to the same lockup, picking light or dark
+from the `Sec-CH-Prefers-Color-Scheme` client hint (requested via `Accept-CH`
+on HTML responses) and defaulting to the light-theme artwork. Nothing ever
+resolves to a 404.
+
+**Cache lifecycle.**
+
+| When | What happens |
+|---|---|
+| Startup | `invalidatePreviewCache` drops every cached screenshot, on disk and in memory, along with every availability verdict. A capture taken while an origin was broken never outlives the process that took it. |
+| Startup, then every 30m | The warmer refreshes the unreachable-capture reference, then screens and captures every indexed target, four at a time, so the HTML rewrite knows each target's verdict before a visitor asks. Healthy targets with a fresh capture are skipped; targets that were down are re-screened, so a site coming back up recovers without a restart. |
+| Static site change | The build hash changes, which changes every public `/__preview/<hash>.webp` URL, and the warmer runs again. |
+| Every 24h | `purgeExpiredPreviewFiles` removes disk entries older than `previewTTL` (7 days). |
+
+Browsers are told to cache a preview for one hour (`previewBrowserTTL`), not
+for the full server-side `previewTTL`: a week-long browser cache would keep
+a bad screenshot on screen long after the server had replaced it.
 
 ## Adding this to a project
 

@@ -14,7 +14,7 @@ exporting implementation details.
 
 - `contact.go` and `captcha.go` implement the contact-form API.
 - `images.go` handles on-demand WebP conversion.
-- `preview.go` rewrites, fetches, and caches server-side previews.
+- `preview.go` rewrites, screens, captures, and caches server-side previews.
 - `status.go` queries Prometheus for blackbox probe results and publishes
   `/api/status`.
 - `watch.go` implements filesystem watching and live-reload SSE.

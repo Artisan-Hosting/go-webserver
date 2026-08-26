@@ -12,7 +12,7 @@
 //   - contact.go          - the /api/contact form handler
 //   - email_templates.go  - HTML/plain-text email bodies
 //   - images.go           - on-the-fly WebP conversion for /imgs/
-//   - preview.go          - server-side link-preview fetching/caching
+//   - preview.go          - server-side link-preview screening/capture/caching
 //   - status.go           - the /api/status Prometheus-backed service status
 //   - watch.go            - filesystem watching and live-reload SSE
 package main
@@ -89,7 +89,10 @@ func run(ctx context.Context, args []string) error {
 	if err := os.MkdirAll(previewCacheDir, 0o755); err != nil {
 		log.Printf("failed to create preview cache dir %s: %v", previewCacheDir, err)
 	}
-	purgeExpiredPreviewFiles(previewCacheDir, previewTTL)
+	// Screenshots are dropped on every start: a capture taken while an
+	// origin was returning a 502 must not outlive the process that took
+	// it. The warmer below re-captures them before anyone asks.
+	invalidatePreviewCache(previewCacheDir, previews)
 
 	// Serve static files
 	hub := newReloadHub()
@@ -111,6 +114,9 @@ func run(ctx context.Context, args []string) error {
 		imageCache:      imageCache,
 		status:          status,
 	}, serverDependencies{})
+	warmer := newPreviewWarmer(previews, previewCacheDir, &http.Client{Timeout: previewWarmRequestTimeout})
+	go runPreviewWarmer(ctx, warmer, previewWarmInterval)
+
 	addr := fmt.Sprintf("0.0.0.0:%d", *port)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -123,6 +129,7 @@ func run(ctx context.Context, args []string) error {
 		currentSiteBuildHash.Store(nextHash)
 		log.Printf("site build hash updated: %s", nextHash)
 		previews.rebuildSourceIndex(staticDir, nextHash)
+		go warmer.warmAll(ctx)
 	}, hub)
 
 	go func() {
