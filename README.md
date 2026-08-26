@@ -101,7 +101,8 @@ both.
 | `STATUS_SELECTOR` | `job=~"blackbox_.+_probe_[ab]"` | PromQL label matchers selecting the blackbox probe jobs. Must exclude jobs that scrape exporter internals rather than probe results. |
 | `STATUS_DEGRADED_WINDOW` | `1h` | How far back a location's missed checks are accumulated when deciding Degraded. |
 | `STATUS_DEGRADED_MISS_RATIO` | `0.05` | Share of checks one location may miss inside that window before the service reads as Degraded. Must be in `[0, 1)`. |
-| `STATUS_DAY_MISS_MINUTES` | `5` | How long a location may be missing checks within one day before that day is marked on the history strip. |
+| `STATUS_DAY_MISS_MINUTES` | `5` | How long a location may be missing checks within one day before that day is marked amber on the history strip. |
+| `STATUS_DAY_OUTAGE_MINUTES` | `1` | How long a target must be unreachable from *every* location at once before a day is marked red. |
 | `STATUS_DEGRADED_MS` | *(unset)* | Optional secondary Degraded signal: every location up but slower than this many milliseconds. Off by default. |
 | `STATUS_CACHE_TTL` | `30s` | How long a status snapshot is served before refreshing. Match your `scrape_interval`; polling faster cannot produce new information. |
 
@@ -299,25 +300,57 @@ At a 30s scrape the defaults mean a location must miss more than ~3 minutes of
 the last hour to trip, while a single failed check is ~0.8% and passes unnoticed.
 `miss_rate` and `locations_missing` on each service report what tripped it.
 
-`uptime` is the mean of `probe_success` averaged across probes, so a
-single-vantage failure counts partially against uptime. `history` carries 30
-daily buckets, oldest first; a bucket with no data in Prometheus is `null` rather
-than `0`, so gaps do not render as outages. Both need TSDB retention at least as
-long as the window being reported.
+`uptime` is measured from whichever location had the best view of the target
+(`max`, not `avg`). Averaging charges a service for a flaky monitoring path: one
+location down for a day out of thirty reports 98.3% uptime for a service that was
+reachable throughout, and contradicts a badge that correctly reads Healthy.
+Locations disagreeing is not hidden — it surfaces as Degraded and on the history
+strip.
+
+`history` carries 30 daily buckets, oldest first; a bucket with no data in
+Prometheus is `null` rather than `0`, so gaps do not render as outages. Both
+`uptime` and `history` need TSDB retention at least as long as the window being
+reported.
+
+### How a day is classified
+
+Each day carries its own `state`, in the same spirit as the live one:
+
+| `state` | Meaning |
+|---|---|
+| `ok` | No location missed more than `STATUS_DAY_MISS_MINUTES`. A handful of failed scrapes over 24 hours is the open internet, not an incident. |
+| `warn` | At least one location missed more than that. However many locations are affected, this stays `warn` while their bad spells never overlap. |
+| `bad` | The target was unreachable from **every** location at once for longer than `STATUS_DAY_OUTAGE_MINUTES`. |
+
+The live `STATUS_DEGRADED_MISS_RATIO` is deliberately not reused here: 5% of a
+day is 72 minutes, which would render an hour-long outage as a clean day. The
+daily thresholds are durations instead.
+
+`bad` is a claim that the target was down, and per-location availability cannot
+support it — two locations each missing 6% of a day may describe one shared
+outage or two disjoint ones. Overlap is therefore measured directly, with
+`avg_over_time((max by (target) (probe_success{...}))[1d:1m])`: `max by (target)`
+collapses the locations at each instant, so averaging it over the day measures
+time when nothing at all could reach the target. **A bucket with no such
+measurement is never marked `bad`**, because that claim would be a guess.
 
 A day that was not clean also carries what monitoring saw, assembled from what
 blackbox already exports:
 
 | Field | Meaning |
 |---|---|
-| `locations_affected` / `locations_total` | How much of the probe redundancy had a bad day. |
+| `availability` | The best location's view of the day, matching how `uptime` is measured. |
+| `outage_minutes` | How long nothing could reach the target. Only present on a `bad` day. |
+| `worst_miss_rate` | Share of the day missed by the worst-affected location. |
+| `locations_affected` / `locations_total` | How many locations missed more than `STATUS_DAY_MISS_MINUTES`. |
 | `no_response` | At least one probe never got an HTTP response — `probe_http_status_code` of `0`, i.e. a DNS, TCP or TLS failure rather than a bad status. |
 | `http_status` | The worst status code seen, reported only when it is `>= 400`. |
 | `content_failed` | `probe_failed_due_to_regex` fired: the target answered, but with the wrong body. |
 
-A clean day carries nothing but `availability`, since there is no failure to
-describe. Fields are omitted rather than zeroed, so absent metrics (a module that
-does not export `probe_failed_due_to_regex`, say) simply produce no claim.
+A clean day carries nothing but `state` and `availability`, since there is no
+failure to describe. Fields are omitted rather than zeroed, so absent metrics (a
+module that does not export `probe_failed_due_to_regex`, say) simply produce no
+claim.
 
 ### Operational notes
 
@@ -332,7 +365,20 @@ outage), and a probed target missing from the allowlist. An empty grid is almost
 always a `target` label that does not match `STATUS_SERVICES`; the logs name the
 exact strings involved.
 
-The 30-day window scans roughly 86k samples per series at a 30s scrape interval,
-and the history query evaluates five such aggregations per step. That is fine for
-a few dozen targets behind the snapshot cache, but a large target list is worth
-backing with recording rules.
+The 30-day window scans roughly 86k samples per series at a 30s scrape interval.
+The expensive part, though, is the overlap subquery, which walks each of the 30
+days at a one-minute step. That is fine for a few dozen targets behind the
+snapshot cache, but if `status: prometheus query failed` starts appearing with
+timeouts, recording the inner expression removes the subquery entirely:
+
+```yaml
+groups:
+  - name: status
+    interval: 30s
+    rules:
+      - record: probe:service_up
+        expr: max by (target) (probe_success{job=~"blackbox_.+_probe_[ab]"})
+```
+
+`avg_over_time(probe:service_up[1d])` over a recorded series is an ordinary range
+aggregation and costs a fraction of the subquery.

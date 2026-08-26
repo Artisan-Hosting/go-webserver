@@ -27,6 +27,7 @@ func testStatusConfig() statusConfig {
 		degradedWindow: defaultDegradedWindow,
 		missRatio:      defaultDegradedMissRatio,
 		dayMissRatio:   defaultDayMissMinutes / minutesPerDay,
+		dayOutageRatio: defaultDayOutageMinutes / minutesPerDay,
 		cacheTTL:       defaultStatusCacheTTL,
 		enabled:        true,
 	}
@@ -285,6 +286,12 @@ func dayAt(target string, at time.Time, perLocation ...float64) []promSeries {
 	return series
 }
 
+// reachableAt states the share of a day the target was reachable from at least
+// one location, which is what separates an outage from disjoint bad spells.
+func reachableAt(target string, at time.Time, share float64) promSeries {
+	return historyPoint(target, "reachable", at, share)
+}
+
 func TestBuildStatusSnapshotCollectsUptimeAndHistory(t *testing.T) {
 	cfg := testStatusConfig()
 	cfg.targets = cfg.targets[:1]
@@ -299,7 +306,9 @@ func TestBuildStatusSnapshotCollectsUptimeAndHistory(t *testing.T) {
 	var history []promSeries
 	history = append(history, dayAt(target, historyStart, 1, 1)...)
 	history = append(history, dayAt(target, historyStart.AddDate(0, 0, 3), 0.5, 0.5)...)
+	history = append(history, reachableAt(target, historyStart.AddDate(0, 0, 3), 0.5))
 	history = append(history, dayAt(target, fixedNow, 0, 0)...)
+	history = append(history, reachableAt(target, fixedNow, 0))
 
 	snapshot, _ := buildStatusSnapshot(cfg, currentFor(target, 2, 2, 0.1, 200), uptime, history, historyStart, fixedNow)
 	service := snapshot.Services[0]
@@ -353,8 +362,10 @@ func TestFinalizeHistoryIgnoresBlipsAndScalesWithScope(t *testing.T) {
 	if day := days[1]; day == nil || day.State != statusWarn || day.LocationsAffected != 1 {
 		t.Errorf("one location having a bad day = %+v, want warn at 1 location", day)
 	}
-	if day := days[2]; day == nil || day.State != statusBad || day.LocationsAffected != 2 {
-		t.Errorf("every location having a bad day = %+v, want bad", day)
+	// Both locations had a bad day, but nothing says those spells overlapped,
+	// so the service was still answering someone throughout.
+	if day := days[2]; day == nil || day.State != statusWarn || day.LocationsAffected != 2 {
+		t.Errorf("every location bad but never at once = %+v, want warn", day)
 	}
 	// Availability tracks the best location, matching the uptime percentages.
 	if day := days[1]; day != nil && day.Availability != 1 {
@@ -418,6 +429,7 @@ func TestBuildStatusSnapshotDistinguishesNoResponseFromBadStatus(t *testing.T) {
 	// blackbox reports status code 0 when a probe never got an HTTP response
 	// at all -- DNS, TCP or TLS -- which is a different story from a 5xx.
 	history := append(dayAt(target, start, 0.4, 0.4),
+		reachableAt(target, start, 0.4),
 		historyPoint(target, "http_min", start, 0),
 		historyPoint(target, "http_max", start, 200),
 		historyPoint(target, "regex", start, 1))
@@ -808,5 +820,87 @@ func TestStatusConfigFromEnvMissThresholdDefaults(t *testing.T) {
 	t.Setenv("STATUS_DEGRADED_MISS_RATIO", "1.5")
 	if cfg := statusConfigFromEnv(); cfg.missRatio != defaultDegradedMissRatio {
 		t.Errorf("ratio = %v, want the default to survive a nonsense value", cfg.missRatio)
+	}
+}
+
+func TestFinalizeHistoryReservesRedForSimultaneousOutages(t *testing.T) {
+	cfg := testStatusConfig()
+	cfg.targets = cfg.targets[:1]
+	target := "https://www.artisanhosting.net"
+	start := fixedNow.AddDate(0, 0, -(statusHistoryDays - 1))
+
+	day := func(n int) time.Time { return start.AddDate(0, 0, n) }
+	var history []promSeries
+
+	// Both locations lost 10% of the day, but never together: something was
+	// always answering, so this is two path problems rather than an outage.
+	history = append(history, dayAt(target, day(0), 0.9, 0.9)...)
+	history = append(history, reachableAt(target, day(0), 1))
+
+	// The same per-location figures, but the bad spells overlapped entirely.
+	history = append(history, dayAt(target, day(1), 0.9, 0.9)...)
+	history = append(history, reachableAt(target, day(1), 0.9))
+
+	// One location lost a big chunk of the day and the other was perfect;
+	// unreachable from everywhere for zero minutes.
+	history = append(history, dayAt(target, day(2), 0.5, 1)...)
+	history = append(history, reachableAt(target, day(2), 1))
+
+	// A single simultaneous missed scrape: ~30s of overlap, under the
+	// one-minute floor, so still not an outage.
+	history = append(history, dayAt(target, day(3), 0.9997, 0.9997)...)
+	history = append(history, reachableAt(target, day(3), 0.9997))
+
+	snapshot, _ := buildStatusSnapshot(cfg, currentFor(target, 2, 2, 0.1, 200), nil, history, start, fixedNow)
+	days := snapshot.Services[0].History
+
+	if got := days[0]; got == nil || got.State != statusWarn {
+		t.Errorf("disjoint bad spells = %+v, want warn: nothing proves an outage", got)
+	}
+	if got := days[0]; got != nil && got.OutageMinutes != 0 {
+		t.Errorf("disjoint bad spells reported %v outage minutes, want 0", got.OutageMinutes)
+	}
+	if got := days[1]; got == nil || got.State != statusBad {
+		t.Errorf("overlapping bad spells = %+v, want bad", got)
+	}
+	if got := days[1]; got != nil && got.OutageMinutes != 144 {
+		t.Errorf("outage minutes = %v, want 144 (10%% of a day)", got.OutageMinutes)
+	}
+	if got := days[2]; got == nil || got.State != statusWarn {
+		t.Errorf("one location losing half a day = %+v, want warn", got)
+	}
+	if got := days[3]; got == nil || got.State != statusOK {
+		t.Errorf("a single simultaneous blip = %+v, want a clean day", got)
+	}
+}
+
+func TestFinalizeHistoryWithoutOverlapEvidenceNeverGoesRed(t *testing.T) {
+	cfg := testStatusConfig()
+	cfg.targets = cfg.targets[:1]
+	target := "https://www.artisanhosting.net"
+	start := fixedNow.AddDate(0, 0, -(statusHistoryDays - 1))
+
+	// No "reachable" series for this bucket. Red claims the target was down;
+	// without the measurement that claim is a guess, so it must not be made.
+	snapshot, _ := buildStatusSnapshot(cfg, currentFor(target, 2, 2, 0.1, 200),
+		nil, dayAt(target, start, 0, 0), start, fixedNow)
+
+	if got := snapshot.Services[0].History[0]; got == nil || got.State != statusBad {
+		t.Logf("day = %+v", got)
+	}
+	if got := snapshot.Services[0].History[0]; got != nil && got.State == statusBad {
+		t.Errorf("state = bad without overlap evidence: %+v", got)
+	}
+}
+
+func TestStatusHistoryQueryMeasuresOverlapDirectly(t *testing.T) {
+	query := statusHistoryQuery(defaultStatusSelector)
+	// max by (target) collapses locations at each instant; averaging that over
+	// the day is what distinguishes an outage from disjoint bad spells.
+	if !strings.Contains(query, "avg_over_time((max by (target) (probe_success{") {
+		t.Errorf("overlap is not measured directly: %s", query)
+	}
+	if !strings.Contains(query, "[1d:"+dayOutageResolution+"]") {
+		t.Errorf("subquery resolution missing: %s", query)
 	}
 }
