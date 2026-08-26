@@ -95,6 +95,15 @@ both.
 | `MAIL_PRODUCT_NAME` | `Artisan Studios` | Shown in email masthead, footer, signature. |
 | `MAIL_PRODUCT_LINK` | `https://www.artisanhosting.net` | Email masthead/footer link target. |
 | `MAIL_PRODUCT_LOGO` | *(unset)* | Masthead logo image URL; falls back to product name as text. |
+| `PROMETHEUS_URL` | *(unset)* | Base URL of a Prometheus holding blackbox_exporter probe results, e.g. `http://127.0.0.1:9090`. Leaving this or `STATUS_SERVICES` unset disables `/api/status`. **Do not expose this Prometheus publicly** — proxying it is the point of the endpoint. |
+| `PROMETHEUS_BEARER_TOKEN` | *(unset)* | Optional `Authorization: Bearer` token, if Prometheus sits behind auth. Never returned to clients. |
+| `STATUS_SERVICES` | *(unset)* | The allowlist: one `<probe target>\|<display name>` per line. A probe target absent from this list is never published, so this doubles as the public/private boundary. Blank lines and `#` comments are ignored; trailing slashes are normalized. |
+| `STATUS_SELECTOR` | `job=~"blackbox_.+_probe_[ab]"` | PromQL label matchers selecting the blackbox probe jobs. Must exclude jobs that scrape exporter internals rather than probe results. |
+| `STATUS_DEGRADED_WINDOW` | `1h` | How far back a location's missed checks are accumulated when deciding Degraded. |
+| `STATUS_DEGRADED_MISS_RATIO` | `0.05` | Share of checks one location may miss inside that window before the service reads as Degraded. Must be in `[0, 1)`. |
+| `STATUS_DAY_MISS_MINUTES` | `5` | How long a location may be missing checks within one day before that day is marked on the history strip. |
+| `STATUS_DEGRADED_MS` | *(unset)* | Optional secondary Degraded signal: every location up but slower than this many milliseconds. Off by default. |
+| `STATUS_CACHE_TTL` | `30s` | How long a status snapshot is served before refreshing. Match your `scrape_interval`; polling faster cannot produce new information. |
 
 See [`docs/MAIL_THEMING.md`](docs/MAIL_THEMING.md) for the full theming
 system and how to add a per-site theme.
@@ -108,6 +117,7 @@ system and how to add a per-site theme.
 | `GET /__preview/*` | `previewImageHandler` | Serves cached server-side link-preview images. |
 | `POST /api/contact` | `contactHandler` | Contact form submission: validates captcha (if enabled), emails submitter + owner. |
 | `GET /api/captcha-config` | `captchaConfigHandler` | Public captcha config (enabled flag + endpoint) for the frontend widget. |
+| `GET /api/status` | `statusHandlerWithDependencies` | Public service status derived from blackbox_exporter probes in Prometheus. See [Service status](#service-status). |
 | `GET /reload` | `reloadHandler` | Server-Sent-Events stream that fires on static file changes, for live reload during local dev. |
 
 ### `/imgs/*` resize/quality query params
@@ -223,3 +233,106 @@ service. The integration target binds an ephemeral loopback port, verifies
 startup and the public routes against the built binary, then checks graceful
 shutdown. Override the coverage threshold when needed with, for example,
 `make test-cover COVERAGE_MIN=80`.
+
+## Service status
+
+`/api/status` publishes uptime for a fixed list of monitored services. It exists
+so that Prometheus itself never has to be reachable from a browser: the API is
+unauthenticated and returns every metric the deployment scrapes, including
+internal hostnames and the full probe target list.
+
+Set `PROMETHEUS_URL` and `STATUS_SERVICES` to enable it. With either unset the
+endpoint returns `503 {"enabled": false}` and a status page can render its own
+"unavailable" state.
+
+```sh
+PROMETHEUS_URL=http://127.0.0.1:9090
+STATUS_SERVICES="
+https://www.artisanhosting.net/|Website
+https://cloud.artisanhosting.net/status.php|Cloud Storage
+"
+```
+
+### What it publishes
+
+Only the display name and the derived numbers. The probe target URL, the
+`instance` label (which is the exporter, not the site), and the job name are
+never included, so the payload cannot be used to enumerate what is monitored.
+
+```json
+{
+  "enabled": true, "generated_at": "...", "stale": false,
+  "overall": "ok", "windows": ["24h", "7d", "30d"],
+  "services": [{
+    "name": "Website", "state": "ok",
+    "http_status": 200, "latency_ms": 84,
+    "probes_up": 2, "probes_total": 2, "last_probe": "...",
+    "uptime": {"24h": 1, "7d": 0.9998, "30d": 0.9994},
+    "history": [
+      {"availability": 1},
+      {"availability": 0.9722, "locations_affected": 1, "locations_total": 2, "http_status": 502},
+      null
+    ]
+  }]
+}
+```
+
+### Assumptions about the scrape config
+
+The queries aggregate `by (target)`, not `by (instance)`. This suits a blackbox
+setup where `relabel_configs` move the probed URL into a `target` label and
+rewrite `__address__` to the exporter's address — the common multi-exporter
+layout, in which `instance` identifies the exporter rather than the probed site.
+If your setup keeps the URL in `instance`, set `STATUS_SELECTOR` accordingly and
+adjust the aggregation.
+
+`state` is deliberately not derived from instantaneous probe agreement. Probing
+from several places over a real network produces a steady trickle of isolated
+failures, and reacting to each one makes the page cry wolf. A location has to
+have missed more than `STATUS_DEGRADED_MISS_RATIO` of its checks over
+`STATUS_DEGRADED_WINDOW` before the service reads as `warn`; below that, a
+location failing right now is ignored so long as another location still sees the
+site and latency is within `STATUS_DEGRADED_MS`. `bad` stays immediate — if
+nothing can reach the target, that is not noise.
+
+At a 30s scrape the defaults mean a location must miss more than ~3 minutes of
+the last hour to trip, while a single failed check is ~0.8% and passes unnoticed.
+`miss_rate` and `locations_missing` on each service report what tripped it.
+
+`uptime` is the mean of `probe_success` averaged across probes, so a
+single-vantage failure counts partially against uptime. `history` carries 30
+daily buckets, oldest first; a bucket with no data in Prometheus is `null` rather
+than `0`, so gaps do not render as outages. Both need TSDB retention at least as
+long as the window being reported.
+
+A day that was not clean also carries what monitoring saw, assembled from what
+blackbox already exports:
+
+| Field | Meaning |
+|---|---|
+| `locations_affected` / `locations_total` | How much of the probe redundancy had a bad day. |
+| `no_response` | At least one probe never got an HTTP response — `probe_http_status_code` of `0`, i.e. a DNS, TCP or TLS failure rather than a bad status. |
+| `http_status` | The worst status code seen, reported only when it is `>= 400`. |
+| `content_failed` | `probe_failed_due_to_regex` fired: the target answered, but with the wrong body. |
+
+A clean day carries nothing but `availability`, since there is no failure to
+describe. Fields are omitted rather than zeroed, so absent metrics (a module that
+does not export `probe_failed_due_to_regex`, say) simply produce no claim.
+
+### Operational notes
+
+A snapshot is cached for `STATUS_CACHE_TTL` and refreshes are single-flighted, so
+a burst of page loads produces one set of queries. If a refresh fails, the last
+good snapshot is served with `"stale": true` rather than blanking the page; only
+an empty cache plus an unreachable Prometheus returns `502`.
+
+Allowlist drift is logged once per distinct problem at `status:` — a configured
+service Prometheus has no data for (dropped rather than published as a false
+outage), and a probed target missing from the allowlist. An empty grid is almost
+always a `target` label that does not match `STATUS_SERVICES`; the logs name the
+exact strings involved.
+
+The 30-day window scans roughly 86k samples per series at a 30s scrape interval,
+and the history query evaluates five such aggregations per step. That is fine for
+a few dozen targets behind the snapshot cache, but a large target list is worth
+backing with recording rules.
