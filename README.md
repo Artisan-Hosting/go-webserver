@@ -99,7 +99,10 @@ both.
 | `PROMETHEUS_BEARER_TOKEN` | *(unset)* | Optional `Authorization: Bearer` token, if Prometheus sits behind auth. Never returned to clients. |
 | `STATUS_SERVICES` | *(unset)* | The allowlist: one `<probe target>\|<display name>` per line. A probe target absent from this list is never published, so this doubles as the public/private boundary. Blank lines and `#` comments are ignored; trailing slashes are normalized. |
 | `STATUS_SELECTOR` | `job=~"blackbox_.+_probe_[ab]"` | PromQL label matchers selecting the blackbox probe jobs. Must exclude jobs that scrape exporter internals rather than probe results. |
-| `STATUS_DEGRADED_MS` | *(unset)* | Optional secondary Degraded signal: both probes up but slower than this many milliseconds. Off by default, so Degraded means precisely "one monitoring location cannot reach this". |
+| `STATUS_DEGRADED_WINDOW` | `1h` | How far back a location's missed checks are accumulated when deciding Degraded. |
+| `STATUS_DEGRADED_MISS_RATIO` | `0.05` | Share of checks one location may miss inside that window before the service reads as Degraded. Must be in `[0, 1)`. |
+| `STATUS_DAY_MISS_MINUTES` | `5` | How long a location may be missing checks within one day before that day is marked on the history strip. |
+| `STATUS_DEGRADED_MS` | *(unset)* | Optional secondary Degraded signal: every location up but slower than this many milliseconds. Off by default. |
 | `STATUS_CACHE_TTL` | `30s` | How long a status snapshot is served before refreshing. Match your `scrape_interval`; polling faster cannot produce new information. |
 
 See [`docs/MAIL_THEMING.md`](docs/MAIL_THEMING.md) for the full theming
@@ -283,9 +286,18 @@ layout, in which `instance` identifies the exporter rather than the probed site.
 If your setup keeps the URL in `instance`, set `STATUS_SELECTOR` accordingly and
 adjust the aggregation.
 
-`state` is derived from probe agreement across however many exporters probe each
-target: all up is `ok`, some up is `warn`, none up is `bad`. With a single
-exporter per target there is no `warn` unless `STATUS_DEGRADED_MS` is set.
+`state` is deliberately not derived from instantaneous probe agreement. Probing
+from several places over a real network produces a steady trickle of isolated
+failures, and reacting to each one makes the page cry wolf. A location has to
+have missed more than `STATUS_DEGRADED_MISS_RATIO` of its checks over
+`STATUS_DEGRADED_WINDOW` before the service reads as `warn`; below that, a
+location failing right now is ignored so long as another location still sees the
+site and latency is within `STATUS_DEGRADED_MS`. `bad` stays immediate — if
+nothing can reach the target, that is not noise.
+
+At a 30s scrape the defaults mean a location must miss more than ~3 minutes of
+the last hour to trip, while a single failed check is ~0.8% and passes unnoticed.
+`miss_rate` and `locations_missing` on each service report what tripped it.
 
 `uptime` is the mean of `probe_success` averaged across probes, so a
 single-vantage failure counts partially against uptime. `history` carries 30

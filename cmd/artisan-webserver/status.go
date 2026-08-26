@@ -45,6 +45,26 @@ const (
 	// defaultStatusCacheTTL matches Prometheus' scrape_interval. Polling
 	// faster than the scrape interval cannot produce new information.
 	defaultStatusCacheTTL = 30 * time.Second
+	// defaultDegradedWindow is how far back a monitoring location's missed
+	// checks are accumulated before it counts as degraded. Long enough that an
+	// isolated failed scrape cannot trip it, short enough that a location
+	// genuinely struggling shows up within minutes.
+	defaultDegradedWindow = "1h"
+	// defaultDegradedMissRatio is the share of checks one location may miss
+	// inside defaultDegradedWindow before the service reads as Degraded. At a
+	// 30s scrape over 1h that is ~6 missed checks; a single blip is ~0.8%.
+	defaultDegradedMissRatio = 0.05
+	// defaultDayMissMinutes is how long a location may be missing checks
+	// within one day before that day is marked on the history strip.
+	//
+	// The live threshold is a share of a short window, which does not carry
+	// over to a daily bucket: 5% of a day is 72 minutes, so reusing it would
+	// paint a full hour-long outage as a clean day. A duration is both stricter
+	// and easier to reason about at this resolution -- long enough to absorb a
+	// couple of failed scrapes, short enough that a real incident always shows.
+	defaultDayMissMinutes = 5.0
+	// minutesPerDay converts defaultDayMissMinutes into a comparable ratio.
+	minutesPerDay = 24 * 60
 	// statusHistoryDays is how many daily buckets the history strip carries.
 	// Requires at least this much TSDB retention to be fully populated;
 	// buckets with no data are published as null rather than as an outage.
@@ -81,13 +101,16 @@ type statusTarget struct {
 // environment. Mirrors captchaConfig(): leaving PROMETHEUS_URL unset disables
 // the endpoint cleanly rather than failing at startup.
 type statusConfig struct {
-	promURL    string
-	bearer     string
-	selector   string
-	targets    []statusTarget
-	degradedMS float64
-	cacheTTL   time.Duration
-	enabled    bool
+	promURL        string
+	bearer         string
+	selector       string
+	targets        []statusTarget
+	degradedWindow string
+	missRatio      float64
+	dayMissRatio   float64
+	degradedMS     float64
+	cacheTTL       time.Duration
+	enabled        bool
 }
 
 // statusService is one published service. Nothing identifying the underlying
@@ -99,6 +122,8 @@ type statusService struct {
 	LatencyMS   int                 `json:"latency_ms,omitempty"`
 	ProbesUp    int                 `json:"probes_up"`
 	ProbesTotal int                 `json:"probes_total"`
+	MissRate    float64             `json:"miss_rate,omitempty"`
+	MissLocs    int                 `json:"locations_missing,omitempty"`
 	LastProbe   *time.Time          `json:"last_probe,omitempty"`
 	Uptime      map[string]float64  `json:"uptime,omitempty"`
 	History     []*statusHistoryDay `json:"history,omitempty"`
@@ -108,12 +133,14 @@ type statusService struct {
 // Availability is only filled in for days that were not perfect, and describes
 // what monitoring observed -- never which host or exporter was involved.
 type statusHistoryDay struct {
-	Availability      float64 `json:"availability"`
-	LocationsAffected int     `json:"locations_affected,omitempty"`
-	LocationsTotal    int     `json:"locations_total,omitempty"`
-	HTTPStatus        int     `json:"http_status,omitempty"`
-	NoResponse        bool    `json:"no_response,omitempty"`
-	ContentFailed     bool    `json:"content_failed,omitempty"`
+	State             statusState `json:"state"`
+	Availability      float64     `json:"availability"`
+	WorstMissRate     float64     `json:"worst_miss_rate,omitempty"`
+	LocationsAffected int         `json:"locations_affected,omitempty"`
+	LocationsTotal    int         `json:"locations_total,omitempty"`
+	HTTPStatus        int         `json:"http_status,omitempty"`
+	NoResponse        bool        `json:"no_response,omitempty"`
+	ContentFailed     bool        `json:"content_failed,omitempty"`
 }
 
 // statusSnapshot is the JSON body served by /api/status.
@@ -123,6 +150,8 @@ type statusSnapshot struct {
 	Stale       bool            `json:"stale"`
 	Overall     statusState     `json:"overall"`
 	Windows     []string        `json:"windows"`
+	MissWindow  string          `json:"miss_window"`
+	MissRatio   float64         `json:"miss_ratio"`
 	Services    []statusService `json:"services"`
 }
 
@@ -138,14 +167,34 @@ type statusDiagnostics struct {
 // full variable table.
 func statusConfigFromEnv() statusConfig {
 	cfg := statusConfig{
-		promURL:  strings.TrimSpace(os.Getenv("PROMETHEUS_URL")),
-		bearer:   strings.TrimSpace(os.Getenv("PROMETHEUS_BEARER_TOKEN")),
-		selector: strings.TrimSpace(os.Getenv("STATUS_SELECTOR")),
-		targets:  parseStatusServices(os.Getenv("STATUS_SERVICES")),
-		cacheTTL: defaultStatusCacheTTL,
+		promURL:        strings.TrimSpace(os.Getenv("PROMETHEUS_URL")),
+		bearer:         strings.TrimSpace(os.Getenv("PROMETHEUS_BEARER_TOKEN")),
+		selector:       strings.TrimSpace(os.Getenv("STATUS_SELECTOR")),
+		targets:        parseStatusServices(os.Getenv("STATUS_SERVICES")),
+		degradedWindow: strings.TrimSpace(os.Getenv("STATUS_DEGRADED_WINDOW")),
+		missRatio:      defaultDegradedMissRatio,
+		dayMissRatio:   defaultDayMissMinutes / minutesPerDay,
+		cacheTTL:       defaultStatusCacheTTL,
 	}
 	if cfg.selector == "" {
 		cfg.selector = defaultStatusSelector
+	}
+	if cfg.degradedWindow == "" {
+		cfg.degradedWindow = defaultDegradedWindow
+	}
+	if raw := strings.TrimSpace(os.Getenv("STATUS_DEGRADED_MISS_RATIO")); raw != "" {
+		if ratio, err := strconv.ParseFloat(raw, 64); err == nil && ratio >= 0 && ratio < 1 {
+			cfg.missRatio = ratio
+		} else {
+			log.Printf("status: ignoring STATUS_DEGRADED_MISS_RATIO %q; want a fraction in [0, 1)", raw)
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("STATUS_DAY_MISS_MINUTES")); raw != "" {
+		if minutes, err := strconv.ParseFloat(raw, 64); err == nil && minutes >= 0 && minutes < minutesPerDay {
+			cfg.dayMissRatio = minutes / minutesPerDay
+		} else {
+			log.Printf("status: ignoring STATUS_DAY_MISS_MINUTES %q; want minutes in [0, %d)", raw, minutesPerDay)
+		}
 	}
 	if raw := strings.TrimSpace(os.Getenv("STATUS_DEGRADED_MS")); raw != "" {
 		if ms, err := strconv.ParseFloat(raw, 64); err == nil && ms > 0 {
@@ -321,29 +370,46 @@ func newPromQuery(client *http.Client, base, bearer string) promQueryFunc {
 // probe's timeout duration and missing status code out of the latency and HTTP
 // figures. timestamp() reports the real scrape time; a sample's own timestamp
 // would just be the query evaluation time.
-func statusCurrentQuery(selector string) string {
+func statusCurrentQuery(cfg statusConfig) string {
+	selector := cfg.selector
+	window := cfg.degradedWindow
+	ratio := strconv.FormatFloat(cfg.missRatio, 'f', -1, 64)
 	clauses := []string{
 		`label_replace(sum by (target) (probe_success{` + selector + `}), "agg", "up", "", "")`,
 		`label_replace(count by (target) (probe_success{` + selector + `}), "agg", "total", "", "")`,
 		`label_replace(avg by (target) (probe_duration_seconds{` + selector + `} and probe_success{` + selector + `} == 1), "agg", "latency", "", "")`,
 		`label_replace(max by (target) (probe_http_status_code{` + selector + `} and probe_success{` + selector + `} == 1), "agg", "http", "", "")`,
 		`label_replace(max by (target) (timestamp(probe_success{` + selector + `})), "agg", "checked", "", "")`,
+		// Worst missed-check rate at any single location over the window, and
+		// how many locations are above the threshold. avg_over_time runs per
+		// series, so the inner result is per-location before max/count reduce
+		// it -- a location quietly missing checks is invisible to an
+		// instantaneous up/total comparison.
+		`label_replace(max by (target) (1 - avg_over_time(probe_success{` + selector + `}[` + window + `])), "agg", "miss", "", "")`,
+		`label_replace(count by (target) ((1 - avg_over_time(probe_success{` + selector + `}[` + window + `])) > ` + ratio + `), "agg", "miss_locs", "", "")`,
 	}
 	return strings.Join(clauses, " or ")
 }
 
-// statusUptimeQuery returns mean probe success per target for each window,
-// tagged with a "window" label.
+// statusUptimeQuery returns probe success per target for each window as seen
+// from whichever monitoring location had the best view, tagged with a "window"
+// label.
 //
-// Averaging across both probes means a single-vantage failure counts partially
-// against uptime, which is consistent with calling that state Degraded rather
-// than Healthy. The alternative -- "up from at least one vantage point" --
-// needs a [30d:30s] subquery, which is an order of magnitude more expensive.
+// max, not avg. Averaging across locations charges the service for a flaky
+// monitoring path: one location down for a day out of thirty reports 98.3%
+// uptime for a service that was reachable throughout, and contradicts a badge
+// that -- correctly -- reads Healthy. Taking the best location answers the
+// question the number is actually for, "was the service up", and keeps it
+// consistent with how state is derived. Locations disagreeing is not hidden;
+// it surfaces as Degraded and on the history strip.
+//
+// The stricter reading, "reachable from at least one location at every instant",
+// needs a [30d:30s] subquery and is orders of magnitude more expensive.
 func statusUptimeQuery(selector string, windows []string) string {
 	clauses := make([]string, 0, len(windows))
 	for _, window := range windows {
 		clauses = append(clauses,
-			`label_replace(avg by (target) (avg_over_time(probe_success{`+selector+`}[`+window+`])), "window", "`+window+`", "", "")`)
+			`label_replace(max by (target) (avg_over_time(probe_success{`+selector+`}[`+window+`])), "window", "`+window+`", "", "")`)
 	}
 	return strings.Join(clauses, " or ")
 }
@@ -353,14 +419,17 @@ func statusUptimeQuery(selector string, windows []string) string {
 // 1d step so the buckets do not overlap, and tagged with an "agg" label so all
 // of it arrives in one range query.
 //
-// The failure story is assembled from what blackbox already exports: a
-// per-location breakdown says how much of the redundancy was lost, a status
-// code of 0 means a probe never got an HTTP response at all (DNS, TCP or TLS),
-// and probe_failed_due_to_regex separates "responded, but with the wrong body"
-// from "responded with a bad status".
+// Availability is measured per location rather than averaged across them, for
+// the same reason the live state is: one location having a bad day is a
+// different event from the service being down, and the two must not be blended
+// into a single number that means neither.
+//
+// The rest of the failure story is assembled from what blackbox already
+// exports: a status code of 0 means a probe never got an HTTP response at all
+// (DNS, TCP or TLS), and probe_failed_due_to_regex separates "responded, but
+// with the wrong body" from "responded with a bad status".
 func statusHistoryQuery(selector string) string {
 	clauses := []string{
-		`label_replace(avg by (target) (avg_over_time(probe_success{` + selector + `}[1d])), "agg", "availability", "", "")`,
 		`label_replace(avg by (target, probe) (avg_over_time(probe_success{` + selector + `}[1d])), "agg", "location", "", "")`,
 		`label_replace(min by (target) (min_over_time(probe_http_status_code{` + selector + `}[1d])), "agg", "http_min", "", "")`,
 		`label_replace(max by (target) (max_over_time(probe_http_status_code{` + selector + `}[1d])), "agg", "http_max", "", "")`,
@@ -377,7 +446,7 @@ func fetchStatusSnapshot(ctx context.Context, cfg statusConfig, query promQueryF
 	historyStart := historyEnd.AddDate(0, 0, -(statusHistoryDays - 1))
 
 	current, err := query(ctx, "/api/v1/query", url.Values{
-		"query": {statusCurrentQuery(cfg.selector)},
+		"query": {statusCurrentQuery(cfg)},
 	})
 	if err != nil {
 		return statusSnapshot{}, statusDiagnostics{}, err
@@ -452,6 +521,10 @@ func buildStatusSnapshot(cfg statusConfig, current, uptime, history []promSeries
 		case "checked":
 			at := time.Unix(int64(series.Value.Value), 0).UTC()
 			entry.service.LastProbe = &at
+		case "miss":
+			entry.service.MissRate = math.Round(series.Value.Value*10000) / 10000
+		case "miss_locs":
+			entry.service.MissLocs = int(math.Round(series.Value.Value))
 		}
 	}
 
@@ -496,7 +569,7 @@ func buildStatusSnapshot(cfg statusConfig, current, uptime, history []promSeries
 		}
 	}
 	for entry, days := range histories {
-		entry.service.History = finalizeHistory(days)
+		entry.service.History = finalizeHistory(days, cfg.dayMissRatio)
 	}
 
 	snapshot := statusSnapshot{
@@ -504,6 +577,8 @@ func buildStatusSnapshot(cfg statusConfig, current, uptime, history []promSeries
 		GeneratedAt: now.UTC(),
 		Overall:     statusOK,
 		Windows:     statusUptimeWindows,
+		MissWindow:  cfg.degradedWindow,
+		MissRatio:   cfg.missRatio,
 		Services:    make([]statusService, 0, len(cfg.targets)),
 	}
 	diags := statusDiagnostics{}
@@ -518,7 +593,7 @@ func buildStatusSnapshot(cfg statusConfig, current, uptime, history []promSeries
 			diags.missingServices = append(diags.missingServices, cfg.targets[i].target)
 			continue
 		}
-		entry.service.State = deriveStatusState(entry.service, cfg.degradedMS)
+		entry.service.State = deriveStatusState(entry.service, cfg)
 		snapshot.Services = append(snapshot.Services, entry.service)
 		snapshot.Overall = worseStatusState(snapshot.Overall, entry.service.State)
 	}
@@ -534,30 +609,22 @@ func buildStatusSnapshot(cfg statusConfig, current, uptime, history []promSeries
 // historyDay accumulates the tagged aggregates for one daily bucket before
 // they are reduced to the published statusHistoryDay.
 type historyDay struct {
-	availability    float64
-	hasAvailability bool
-	locationsTotal  int
-	locationsLost   int
-	httpMin         float64
-	httpMax         float64
-	hasHTTP         bool
-	contentFailed   bool
+	// One availability figure per monitoring location, kept apart so a bad
+	// location cannot be averaged away by a good one.
+	locations     []float64
+	httpMin       float64
+	httpMax       float64
+	hasHTTP       bool
+	contentFailed bool
 }
 
 // observe folds one sample into the day, keyed by the "agg" label its query
 // clause tagged it with.
 func (d *historyDay) observe(agg string, value float64) {
 	switch agg {
-	case "availability":
-		d.availability = value
-		d.hasAvailability = true
 	case "location":
-		// One series per monitoring location, so counting them gives both how
-		// many were watching and how many had a bad day.
-		d.locationsTotal++
-		if value < 1 {
-			d.locationsLost++
-		}
+		// One series per monitoring location.
+		d.locations = append(d.locations, value)
 	case "http_min":
 		if !d.hasHTTP || value < d.httpMin {
 			d.httpMin = value
@@ -574,21 +641,53 @@ func (d *historyDay) observe(agg string, value float64) {
 	}
 }
 
-// finalizeHistory converts accumulated buckets to the published strip. A day
-// Prometheus has no data for stays nil so the page can render it as "no data"
-// rather than as an outage, and a clean day carries nothing but its
-// availability -- there is no failure to describe.
-func finalizeHistory(days []historyDay) []*statusHistoryDay {
+// finalizeHistory converts accumulated buckets to the published strip.
+//
+// Each day is classified the same way the live state is, so a bar means what
+// the badge means: a location that missed more than dayMissRatio of the day
+// counts against it, one such location is warn, all of them is bad. Below that
+// threshold a day is clean -- a handful of failed scrapes over 24 hours is the
+// open internet, not an incident, and colouring the day for it was the same
+// false alarm the live rule exists to avoid.
+//
+// A day Prometheus has no data for stays nil so the page can render it as "no
+// data" rather than as an outage.
+func finalizeHistory(days []historyDay, dayMissRatio float64) []*statusHistoryDay {
 	out := make([]*statusHistoryDay, len(days))
 	for i := range days {
 		day := days[i]
-		if !day.hasAvailability {
+		if len(day.locations) == 0 {
 			continue
 		}
-		published := &statusHistoryDay{Availability: math.Round(day.availability*10000) / 10000}
-		if published.Availability < 1 {
-			published.LocationsAffected = day.locationsLost
-			published.LocationsTotal = day.locationsTotal
+
+		best, worst := day.locations[0], day.locations[0]
+		affected := 0
+		for _, availability := range day.locations {
+			best = math.Max(best, availability)
+			worst = math.Min(worst, availability)
+			if 1-availability > dayMissRatio {
+				affected++
+			}
+		}
+
+		published := &statusHistoryDay{
+			// Availability is the best location's view, matching how the
+			// uptime percentages are measured.
+			Availability:   math.Round(best*10000) / 10000,
+			LocationsTotal: len(day.locations),
+		}
+		switch {
+		case affected == 0:
+			published.State = statusOK
+		case affected < len(day.locations):
+			published.State = statusWarn
+		default:
+			published.State = statusBad
+		}
+
+		if published.State != statusOK {
+			published.WorstMissRate = math.Round((1-worst)*10000) / 10000
+			published.LocationsAffected = affected
 			published.ContentFailed = day.contentFailed
 			// A status code of 0 is blackbox reporting that a probe never got
 			// an HTTP response, which is a different story from a bad status.
@@ -602,17 +701,24 @@ func finalizeHistory(days []historyDay) []*statusHistoryDay {
 	return out
 }
 
-// deriveStatusState maps probe agreement onto the page's three states. The
-// optional degradedMS threshold is a secondary signal only: with it unset
-// (the default) Degraded means precisely "one of two monitoring locations
-// cannot reach this".
-func deriveStatusState(service statusService, degradedMS float64) statusState {
+// deriveStatusState maps monitoring onto the page's three states.
+//
+// Degraded is deliberately NOT "some location cannot reach it right now".
+// Probing from several places over a real network produces a steady trickle
+// of isolated failures, and reacting to each one makes the page cry wolf.
+// Instead a location has to have been missing checks for a while -- more than
+// cfg.missRatio of cfg.degradedWindow -- before it counts. Below that, a
+// location currently failing is ignored so long as another location still
+// sees the site and latency is fine.
+//
+// Down is still immediate: if nothing can reach it, that is not noise.
+func deriveStatusState(service statusService, cfg statusConfig) statusState {
 	switch {
 	case service.ProbesUp == 0:
 		return statusBad
-	case service.ProbesUp < service.ProbesTotal:
+	case service.MissRate > cfg.missRatio:
 		return statusWarn
-	case degradedMS > 0 && float64(service.LatencyMS) > degradedMS:
+	case cfg.degradedMS > 0 && float64(service.LatencyMS) > cfg.degradedMS:
 		return statusWarn
 	default:
 		return statusOK

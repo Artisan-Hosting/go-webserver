@@ -24,8 +24,11 @@ func testStatusConfig() statusConfig {
 			{target: "https://www.artisanhosting.net", name: "Website"},
 			{target: "https://cloud.artisanhosting.net/status.php", name: "Cloud Storage"},
 		},
-		cacheTTL: defaultStatusCacheTTL,
-		enabled:  true,
+		degradedWindow: defaultDegradedWindow,
+		missRatio:      defaultDegradedMissRatio,
+		dayMissRatio:   defaultDayMissMinutes / minutesPerDay,
+		cacheTTL:       defaultStatusCacheTTL,
+		enabled:        true,
 	}
 }
 
@@ -34,15 +37,26 @@ func instantSeries(labels map[string]string, value float64) promSeries {
 	return promSeries{Metric: labels, Value: promSample{At: fixedNow, Value: value}}
 }
 
-// currentFor produces the five per-target aggregates statusCurrentQuery returns.
+// currentFor produces the per-target aggregates statusCurrentQuery returns,
+// for a target with no sustained missed checks.
 func currentFor(target string, up, total, latencySeconds, httpStatus float64) []promSeries {
-	return []promSeries{
+	return append(missFor(target, 0, 0), []promSeries{
 		instantSeries(map[string]string{"target": target, "agg": "up"}, up),
 		instantSeries(map[string]string{"target": target, "agg": "total"}, total),
 		instantSeries(map[string]string{"target": target, "agg": "latency"}, latencySeconds),
 		instantSeries(map[string]string{"target": target, "agg": "http"}, httpStatus),
 		instantSeries(map[string]string{"target": target, "agg": "checked"}, float64(fixedNow.Add(-15*time.Second).Unix())),
+	}...)
+}
+
+// missFor produces the sustained missed-check aggregates: the worst rate at any
+// single location, and how many locations are over the threshold.
+func missFor(target string, rate float64, locations int) []promSeries {
+	series := []promSeries{instantSeries(map[string]string{"target": target, "agg": "miss"}, rate)}
+	if locations > 0 {
+		series = append(series, instantSeries(map[string]string{"target": target, "agg": "miss_locs"}, float64(locations)))
 	}
+	return series
 }
 
 func serviceByName(t *testing.T, snapshot statusSnapshot, name string) statusService {
@@ -131,7 +145,7 @@ func TestStatusConfigFromEnvDefaults(t *testing.T) {
 func TestStatusSelectorExcludesExporterInternals(t *testing.T) {
 	// job="blackbox_exporter" and job="prometheus" scrape exporter internals,
 	// not probe results, and must not be swept into the status page.
-	query := statusCurrentQuery(defaultStatusSelector)
+	query := statusCurrentQuery(testStatusConfig())
 	if !strings.Contains(query, `job=~"blackbox_.+_probe_[ab]"`) {
 		t.Fatalf("current query lost its job selector: %s", query)
 	}
@@ -147,12 +161,16 @@ func TestStatusSelectorExcludesExporterInternals(t *testing.T) {
 	}
 }
 
-func TestBuildStatusSnapshotDerivesStateFromProbeAgreement(t *testing.T) {
+func TestBuildStatusSnapshotDerivesState(t *testing.T) {
 	cfg := testStatusConfig()
 	cfg.targets = append(cfg.targets, statusTarget{target: "https://office.artisanhosting.net", name: "Office"})
 
 	current := currentFor("https://www.artisanhosting.net/", 2, 2, 0.084, 200)
-	current = append(current, currentFor("https://cloud.artisanhosting.net/status.php", 1, 2, 0.210, 200)...)
+	// One location is down this instant but has a clean trailing window, so
+	// this is a blip rather than a degradation. See the sustained-miss tests.
+	current = append(current, withMiss(
+		currentFor("https://cloud.artisanhosting.net/status.php", 1, 2, 0.210, 200),
+		"https://cloud.artisanhosting.net/status.php", 0.004, 0)...)
 	current = append(current, currentFor("https://office.artisanhosting.net", 0, 2, 0, 0)...)
 
 	snapshot, _ := buildStatusSnapshot(cfg, current, nil, nil, fixedNow.AddDate(0, 0, -29), fixedNow)
@@ -160,8 +178,8 @@ func TestBuildStatusSnapshotDerivesStateFromProbeAgreement(t *testing.T) {
 	if got := serviceByName(t, snapshot, "Website").State; got != statusOK {
 		t.Errorf("both probes up: state = %q, want %q", got, statusOK)
 	}
-	if got := serviceByName(t, snapshot, "Cloud Storage").State; got != statusWarn {
-		t.Errorf("one probe up: state = %q, want %q", got, statusWarn)
+	if got := serviceByName(t, snapshot, "Cloud Storage").State; got != statusOK {
+		t.Errorf("one probe up, clean window: state = %q, want %q", got, statusOK)
 	}
 	if got := serviceByName(t, snapshot, "Office").State; got != statusBad {
 		t.Errorf("no probes up: state = %q, want %q", got, statusBad)
@@ -250,26 +268,40 @@ func TestBuildStatusSnapshotLatencyThresholdDegrades(t *testing.T) {
 	}
 }
 
+// dayAt builds the per-location daily availability series for one bucket, one
+// value per monitoring location.
+func dayAt(target string, at time.Time, perLocation ...float64) []promSeries {
+	series := make([]promSeries, 0, len(perLocation))
+	for i, availability := range perLocation {
+		series = append(series, promSeries{
+			Metric: map[string]string{
+				"target": target,
+				"agg":    "location",
+				"probe":  fmt.Sprintf("probe_%c", 'a'+i),
+			},
+			Values: []promSample{{At: at, Value: availability}},
+		})
+	}
+	return series
+}
+
 func TestBuildStatusSnapshotCollectsUptimeAndHistory(t *testing.T) {
 	cfg := testStatusConfig()
 	cfg.targets = cfg.targets[:1]
+	target := "https://www.artisanhosting.net"
 	historyStart := fixedNow.AddDate(0, 0, -(statusHistoryDays - 1))
 
 	uptime := []promSeries{
-		instantSeries(map[string]string{"target": "https://www.artisanhosting.net", "window": "24h"}, 1),
-		instantSeries(map[string]string{"target": "https://www.artisanhosting.net", "window": "7d"}, 0.99981234),
-		instantSeries(map[string]string{"target": "https://www.artisanhosting.net", "window": "30d"}, 0.9994),
+		instantSeries(map[string]string{"target": target, "window": "24h"}, 1),
+		instantSeries(map[string]string{"target": target, "window": "7d"}, 0.99981234),
+		instantSeries(map[string]string{"target": target, "window": "30d"}, 0.9994),
 	}
-	history := []promSeries{{
-		Metric: map[string]string{"target": "https://www.artisanhosting.net", "agg": "availability"},
-		Values: []promSample{
-			{At: historyStart, Value: 1},
-			{At: historyStart.AddDate(0, 0, 3), Value: 0.5},
-			{At: fixedNow, Value: 0},
-		},
-	}}
+	var history []promSeries
+	history = append(history, dayAt(target, historyStart, 1, 1)...)
+	history = append(history, dayAt(target, historyStart.AddDate(0, 0, 3), 0.5, 0.5)...)
+	history = append(history, dayAt(target, fixedNow, 0, 0)...)
 
-	snapshot, _ := buildStatusSnapshot(cfg, currentFor("https://www.artisanhosting.net", 2, 2, 0.1, 200), uptime, history, historyStart, fixedNow)
+	snapshot, _ := buildStatusSnapshot(cfg, currentFor(target, 2, 2, 0.1, 200), uptime, history, historyStart, fixedNow)
 	service := snapshot.Services[0]
 
 	if service.Uptime["24h"] != 1 {
@@ -281,19 +313,139 @@ func TestBuildStatusSnapshotCollectsUptimeAndHistory(t *testing.T) {
 	if len(service.History) != statusHistoryDays {
 		t.Fatalf("history has %d buckets, want %d", len(service.History), statusHistoryDays)
 	}
-	if service.History[0] == nil || service.History[0].Availability != 1 {
-		t.Errorf("first bucket = %v, want 1", service.History[0])
+	if day := service.History[0]; day == nil || day.Availability != 1 || day.State != statusOK {
+		t.Errorf("first bucket = %+v, want a clean day", day)
 	}
-	if service.History[3] == nil || service.History[3].Availability != 0.5 {
-		t.Errorf("fourth bucket = %v, want 0.5", service.History[3])
+	if day := service.History[3]; day == nil || day.Availability != 0.5 || day.State != statusBad {
+		t.Errorf("fourth bucket = %+v, want 0.5 availability and bad", day)
 	}
-	if last := service.History[statusHistoryDays-1]; last == nil || last.Availability != 0 {
-		t.Errorf("last bucket = %v, want 0", last)
+	if day := service.History[statusHistoryDays-1]; day == nil || day.Availability != 0 || day.State != statusBad {
+		t.Errorf("last bucket = %+v, want 0 availability and bad", day)
 	}
 	// Buckets Prometheus had no data for stay null so the page can render
 	// them as "no data" rather than as an outage.
 	if service.History[1] != nil {
 		t.Errorf("gap bucket = %v, want null", service.History[1])
+	}
+}
+
+func TestFinalizeHistoryIgnoresBlipsAndScalesWithScope(t *testing.T) {
+	cfg := testStatusConfig()
+	cfg.targets = cfg.targets[:1]
+	target := "https://www.artisanhosting.net"
+	start := fixedNow.AddDate(0, 0, -(statusHistoryDays - 1))
+
+	// 0.35% of a day is the 5-minute threshold; 2 missed scrapes out of 2880
+	// is ~0.07% and must not colour the day.
+	var history []promSeries
+	history = append(history, dayAt(target, start, 0.9993, 1)...)                   // blip
+	history = append(history, dayAt(target, start.AddDate(0, 0, 1), 0.95, 1)...)    // one location
+	history = append(history, dayAt(target, start.AddDate(0, 0, 2), 0.95, 0.93)...) // every location
+	snapshot, _ := buildStatusSnapshot(cfg, currentFor(target, 2, 2, 0.1, 200), nil, history, start, fixedNow)
+	days := snapshot.Services[0].History
+
+	if day := days[0]; day == nil || day.State != statusOK {
+		t.Errorf("a couple of failed scrapes in 24h = %+v, want a clean day", day)
+	}
+	if day := days[0]; day != nil && day.LocationsAffected != 0 {
+		t.Errorf("clean day should name no affected locations, got %+v", day)
+	}
+	if day := days[1]; day == nil || day.State != statusWarn || day.LocationsAffected != 1 {
+		t.Errorf("one location having a bad day = %+v, want warn at 1 location", day)
+	}
+	if day := days[2]; day == nil || day.State != statusBad || day.LocationsAffected != 2 {
+		t.Errorf("every location having a bad day = %+v, want bad", day)
+	}
+	// Availability tracks the best location, matching the uptime percentages.
+	if day := days[1]; day != nil && day.Availability != 1 {
+		t.Errorf("availability = %v, want the best location's view", day.Availability)
+	}
+	if day := days[1]; day != nil && day.WorstMissRate != 0.05 {
+		t.Errorf("worst miss rate = %v, want 0.05", day.WorstMissRate)
+	}
+}
+
+func TestBuildStatusSnapshotExplainsBadDays(t *testing.T) {
+	cfg := testStatusConfig()
+	cfg.targets = cfg.targets[:1]
+	target := "https://www.artisanhosting.net"
+	start := fixedNow.AddDate(0, 0, -(statusHistoryDays - 1))
+	badDay := start.AddDate(0, 0, 5)
+
+	var history []promSeries
+	history = append(history, dayAt(target, start, 1, 1)...)
+	history = append(history, dayAt(target, badDay, 1, 0.9444)...)
+	history = append(history,
+		historyPoint(target, "http_min", badDay, 200),
+		historyPoint(target, "http_max", badDay, 502))
+
+	snapshot, _ := buildStatusSnapshot(cfg, currentFor(target, 2, 2, 0.1, 200), nil, history, start, fixedNow)
+	days := snapshot.Services[0].History
+
+	clean := days[0]
+	if clean == nil || clean.State != statusOK {
+		t.Fatalf("clean day = %+v, want a clean day", clean)
+	}
+	// A clean day has no failure to describe, so it carries nothing else.
+	if clean.HTTPStatus != 0 || clean.NoResponse || clean.ContentFailed || clean.LocationsAffected != 0 {
+		t.Errorf("clean day should carry no failure detail, got %+v", clean)
+	}
+
+	bad := days[5]
+	if bad == nil {
+		t.Fatal("expected the bad day to be published")
+	}
+	if bad.State != statusWarn {
+		t.Errorf("state = %q, want %q: one of two locations struggled", bad.State, statusWarn)
+	}
+	if bad.LocationsAffected != 1 || bad.LocationsTotal != 2 {
+		t.Errorf("locations = %d/%d, want 1/2", bad.LocationsAffected, bad.LocationsTotal)
+	}
+	if bad.HTTPStatus != 502 {
+		t.Errorf("http status = %d, want 502", bad.HTTPStatus)
+	}
+	if bad.NoResponse {
+		t.Error("a day whose probes all got an HTTP response must not report no_response")
+	}
+}
+
+func TestBuildStatusSnapshotDistinguishesNoResponseFromBadStatus(t *testing.T) {
+	cfg := testStatusConfig()
+	cfg.targets = cfg.targets[:1]
+	target := "https://www.artisanhosting.net"
+	start := fixedNow.AddDate(0, 0, -(statusHistoryDays - 1))
+
+	// blackbox reports status code 0 when a probe never got an HTTP response
+	// at all -- DNS, TCP or TLS -- which is a different story from a 5xx.
+	history := append(dayAt(target, start, 0.4, 0.4),
+		historyPoint(target, "http_min", start, 0),
+		historyPoint(target, "http_max", start, 200),
+		historyPoint(target, "regex", start, 1))
+
+	snapshot, _ := buildStatusSnapshot(cfg, currentFor(target, 2, 2, 0.1, 200), nil, history, start, fixedNow)
+	day := snapshot.Services[0].History[0]
+
+	if day == nil || !day.NoResponse {
+		t.Fatalf("expected no_response for a day containing a status code of 0, got %+v", day)
+	}
+	// 200 is not a failure code, so it must not be surfaced as the cause.
+	if day.HTTPStatus != 0 {
+		t.Errorf("http status = %d; only error codes should be reported", day.HTTPStatus)
+	}
+	if !day.ContentFailed {
+		t.Error("expected the regex failure to be reported")
+	}
+}
+
+func TestStatusUptimeQueryUsesBestLocation(t *testing.T) {
+	query := statusUptimeQuery(defaultStatusSelector, []string{"24h"})
+	// avg across locations charges the service for a flaky monitoring path and
+	// contradicts a badge that reads Healthy.
+	if !strings.Contains(query, "max by (target) (avg_over_time(") {
+		t.Errorf("uptime should be measured from the best location: %s", query)
+	}
+	if strings.Contains(query, "avg by (target)") {
+		t.Errorf("uptime must not average across locations: %s", query)
 	}
 }
 
@@ -312,7 +464,7 @@ func stubQuery(current, uptime, history []promSeries, err error) (promQueryFunc,
 		if path == "/api/v1/query_range" {
 			return history, nil
 		}
-		if strings.Contains(params.Get("query"), "avg_over_time") {
+		if strings.Contains(params.Get("query"), `"window"`) {
 			return uptime, nil
 		}
 		return current, nil
@@ -397,7 +549,7 @@ func TestStatusHandlerServesStaleSnapshotWhenPrometheusFails(t *testing.T) {
 		if failing {
 			return nil, fmt.Errorf("connection refused")
 		}
-		if path == "/api/v1/query_range" || strings.Contains(params.Get("query"), "avg_over_time") {
+		if path == "/api/v1/query_range" || strings.Contains(params.Get("query"), `"window"`) {
 			return nil, nil
 		}
 		return current, nil
@@ -523,82 +675,138 @@ func historyPoint(target, agg string, at time.Time, value float64) promSeries {
 	}
 }
 
-func TestBuildStatusSnapshotExplainsBadDays(t *testing.T) {
+// withMiss replaces the sustained miss aggregates on a currentFor result.
+func withMiss(current []promSeries, target string, rate float64, locations int) []promSeries {
+	kept := current[:0:0]
+	for _, series := range current {
+		if agg := series.Metric["agg"]; agg == "miss" || agg == "miss_locs" {
+			continue
+		}
+		kept = append(kept, series)
+	}
+	return append(kept, missFor(target, rate, locations)...)
+}
+
+func TestDeriveStatusStateIgnoresIsolatedProbeFailures(t *testing.T) {
 	cfg := testStatusConfig()
 	cfg.targets = cfg.targets[:1]
 	target := "https://www.artisanhosting.net"
-	start := fixedNow.AddDate(0, 0, -(statusHistoryDays - 1))
-	badDay := start.AddDate(0, 0, 5)
-	cleanDay := start
 
-	history := []promSeries{
-		historyPoint(target, "availability", cleanDay, 1),
-		historyPoint(target, "availability", badDay, 0.9722),
-		// One of two monitoring locations had a bad day.
-		{Metric: map[string]string{"target": target, "agg": "location", "probe": "probe_a"},
-			Values: []promSample{{At: badDay, Value: 1}}},
-		{Metric: map[string]string{"target": target, "agg": "location", "probe": "probe_b"},
-			Values: []promSample{{At: badDay, Value: 0.94}}},
-		historyPoint(target, "http_min", badDay, 200),
-		historyPoint(target, "http_max", badDay, 502),
-	}
+	// One location is failing this instant, but has missed only 0.8% of the
+	// last hour -- a blip. Another location still sees the site, so this is
+	// noise and must not reach the page as Degraded.
+	current := withMiss(currentFor(target, 1, 2, 0.1, 200), target, 0.008, 0)
+	snapshot, _ := buildStatusSnapshot(cfg, current, nil, nil, fixedNow, fixedNow)
 
-	snapshot, _ := buildStatusSnapshot(cfg, currentFor(target, 2, 2, 0.1, 200), nil, history, start, fixedNow)
-	days := snapshot.Services[0].History
-
-	clean := days[0]
-	if clean == nil || clean.Availability != 1 {
-		t.Fatalf("clean day = %+v, want availability 1", clean)
+	if got := snapshot.Services[0].State; got != statusOK {
+		t.Errorf("state = %q, want %q: an isolated failure under the threshold is noise", got, statusOK)
 	}
-	// A clean day has no failure to describe, so it carries nothing else.
-	if clean.LocationsTotal != 0 || clean.HTTPStatus != 0 || clean.NoResponse || clean.ContentFailed {
-		t.Errorf("clean day should carry no failure detail, got %+v", clean)
-	}
-
-	bad := days[5]
-	if bad == nil {
-		t.Fatal("expected the bad day to be published")
-	}
-	if bad.Availability != 0.9722 {
-		t.Errorf("availability = %v, want 0.9722", bad.Availability)
-	}
-	if bad.LocationsAffected != 1 || bad.LocationsTotal != 2 {
-		t.Errorf("locations = %d/%d, want 1/2", bad.LocationsAffected, bad.LocationsTotal)
-	}
-	if bad.HTTPStatus != 502 {
-		t.Errorf("http status = %d, want 502", bad.HTTPStatus)
-	}
-	if bad.NoResponse {
-		t.Error("a day whose probes all got an HTTP response must not report no_response")
+	if snapshot.Overall != statusOK {
+		t.Errorf("overall = %q, want %q", snapshot.Overall, statusOK)
 	}
 }
 
-func TestBuildStatusSnapshotDistinguishesNoResponseFromBadStatus(t *testing.T) {
+func TestDeriveStatusStateDegradesOnSustainedMissedChecks(t *testing.T) {
 	cfg := testStatusConfig()
 	cfg.targets = cfg.targets[:1]
 	target := "https://www.artisanhosting.net"
-	start := fixedNow.AddDate(0, 0, -(statusHistoryDays - 1))
 
-	// blackbox reports status code 0 when a probe never got an HTTP response
-	// at all -- DNS, TCP or TLS -- which is a different story from a 5xx.
-	history := []promSeries{
-		historyPoint(target, "availability", start, 0.4),
-		historyPoint(target, "http_min", start, 0),
-		historyPoint(target, "http_max", start, 200),
-		historyPoint(target, "regex", start, 1),
+	// Every location answers right now, but one has missed 12% of the window.
+	// Quiet flakiness at a single location is exactly what should surface.
+	current := withMiss(currentFor(target, 2, 2, 0.1, 200), target, 0.12, 1)
+	snapshot, _ := buildStatusSnapshot(cfg, current, nil, nil, fixedNow, fixedNow)
+
+	service := snapshot.Services[0]
+	if service.State != statusWarn {
+		t.Errorf("state = %q, want %q", service.State, statusWarn)
+	}
+	if service.MissRate != 0.12 {
+		t.Errorf("miss rate = %v, want 0.12", service.MissRate)
+	}
+	if service.MissLocs != 1 {
+		t.Errorf("locations over threshold = %d, want 1", service.MissLocs)
+	}
+}
+
+func TestDeriveStatusStateBoundaryIsExclusive(t *testing.T) {
+	cfg := testStatusConfig()
+	cfg.targets = cfg.targets[:1]
+	target := "https://www.artisanhosting.net"
+
+	for _, tc := range []struct {
+		name string
+		rate float64
+		want statusState
+	}{
+		{"exactly at the threshold", 0.05, statusOK},
+		{"just over the threshold", 0.0501, statusWarn},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			current := withMiss(currentFor(target, 2, 2, 0.1, 200), target, tc.rate, 0)
+			snapshot, _ := buildStatusSnapshot(cfg, current, nil, nil, fixedNow, fixedNow)
+			if got := snapshot.Services[0].State; got != tc.want {
+				t.Errorf("miss rate %v: state = %q, want %q", tc.rate, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDeriveStatusStateDownBeatsTheMissThreshold(t *testing.T) {
+	cfg := testStatusConfig()
+	cfg.targets = cfg.targets[:1]
+	target := "https://www.artisanhosting.net"
+
+	// Nothing can reach it. However clean the trailing window looks, a total
+	// outage is never noise to be smoothed away.
+	current := withMiss(currentFor(target, 0, 2, 0, 0), target, 0, 0)
+	snapshot, _ := buildStatusSnapshot(cfg, current, nil, nil, fixedNow, fixedNow)
+
+	if got := snapshot.Services[0].State; got != statusBad {
+		t.Errorf("state = %q, want %q", got, statusBad)
+	}
+}
+
+func TestStatusCurrentQueryMeasuresMissesPerLocation(t *testing.T) {
+	cfg := testStatusConfig()
+	cfg.degradedWindow = "2h"
+	cfg.missRatio = 0.1
+	query := statusCurrentQuery(cfg)
+
+	// avg_over_time must run per series so the rate is per location; reducing
+	// with max by (target) first would average a bad location away.
+	if !strings.Contains(query, `max by (target) (1 - avg_over_time(probe_success{`) {
+		t.Errorf("miss rate is not measured per location: %s", query)
+	}
+	if !strings.Contains(query, "[2h]") {
+		t.Errorf("query ignores the configured window: %s", query)
+	}
+	if !strings.Contains(query, "> 0.1") {
+		t.Errorf("query ignores the configured ratio: %s", query)
+	}
+}
+
+func TestStatusConfigFromEnvMissThresholdDefaults(t *testing.T) {
+	t.Setenv("PROMETHEUS_URL", "http://prometheus.test")
+	t.Setenv("STATUS_SERVICES", "https://www.artisanhosting.net|Website")
+	t.Setenv("STATUS_DEGRADED_WINDOW", "")
+	t.Setenv("STATUS_DEGRADED_MISS_RATIO", "")
+
+	cfg := statusConfigFromEnv()
+	if cfg.degradedWindow != defaultDegradedWindow {
+		t.Errorf("window = %q, want %q", cfg.degradedWindow, defaultDegradedWindow)
+	}
+	if cfg.missRatio != defaultDegradedMissRatio {
+		t.Errorf("ratio = %v, want %v", cfg.missRatio, defaultDegradedMissRatio)
 	}
 
-	snapshot, _ := buildStatusSnapshot(cfg, currentFor(target, 2, 2, 0.1, 200), nil, history, start, fixedNow)
-	day := snapshot.Services[0].History[0]
-
-	if day == nil || !day.NoResponse {
-		t.Fatalf("expected no_response for a day containing a status code of 0, got %+v", day)
+	t.Setenv("STATUS_DEGRADED_MISS_RATIO", "0.02")
+	if cfg := statusConfigFromEnv(); cfg.missRatio != 0.02 {
+		t.Errorf("ratio = %v, want 0.02", cfg.missRatio)
 	}
-	// 200 is not a failure code, so it must not be surfaced as the cause.
-	if day.HTTPStatus != 0 {
-		t.Errorf("http status = %d; only error codes should be reported", day.HTTPStatus)
-	}
-	if !day.ContentFailed {
-		t.Error("expected the regex failure to be reported")
+	// A ratio of 1 or more could never trip, so it is refused rather than
+	// silently disabling the signal.
+	t.Setenv("STATUS_DEGRADED_MISS_RATIO", "1.5")
+	if cfg := statusConfigFromEnv(); cfg.missRatio != defaultDegradedMissRatio {
+		t.Errorf("ratio = %v, want the default to survive a nonsense value", cfg.missRatio)
 	}
 }
