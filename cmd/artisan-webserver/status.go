@@ -63,7 +63,20 @@ const (
 	// and easier to reason about at this resolution -- long enough to absorb a
 	// couple of failed scrapes, short enough that a real incident always shows.
 	defaultDayMissMinutes = 5.0
-	// minutesPerDay converts defaultDayMissMinutes into a comparable ratio.
+	// defaultDayOutageMinutes is how long a target must be unreachable from
+	// every monitoring location at once before a day counts as an outage.
+	//
+	// Red is reserved for this. Two locations each having a bad day is two
+	// path problems; the service was reachable throughout unless their bad
+	// spells actually overlapped, and only a simultaneous failure is evidence
+	// the target itself was down. A minute of overlap is two consecutive
+	// missed scrapes at a 30s interval, which is past coincidence.
+	defaultDayOutageMinutes = 1.0
+	// dayOutageResolution is the step the simultaneity subquery walks the day
+	// at. Matching defaultDayOutageMinutes keeps the subquery half the cost of
+	// stepping at the scrape interval while still resolving what it measures.
+	dayOutageResolution = "1m"
+	// minutesPerDay converts the day thresholds into comparable ratios.
 	minutesPerDay = 24 * 60
 	// statusHistoryDays is how many daily buckets the history strip carries.
 	// Requires at least this much TSDB retention to be fully populated;
@@ -108,6 +121,7 @@ type statusConfig struct {
 	degradedWindow string
 	missRatio      float64
 	dayMissRatio   float64
+	dayOutageRatio float64
 	degradedMS     float64
 	cacheTTL       time.Duration
 	enabled        bool
@@ -135,6 +149,7 @@ type statusService struct {
 type statusHistoryDay struct {
 	State             statusState `json:"state"`
 	Availability      float64     `json:"availability"`
+	OutageMinutes     float64     `json:"outage_minutes,omitempty"`
 	WorstMissRate     float64     `json:"worst_miss_rate,omitempty"`
 	LocationsAffected int         `json:"locations_affected,omitempty"`
 	LocationsTotal    int         `json:"locations_total,omitempty"`
@@ -174,6 +189,7 @@ func statusConfigFromEnv() statusConfig {
 		degradedWindow: strings.TrimSpace(os.Getenv("STATUS_DEGRADED_WINDOW")),
 		missRatio:      defaultDegradedMissRatio,
 		dayMissRatio:   defaultDayMissMinutes / minutesPerDay,
+		dayOutageRatio: defaultDayOutageMinutes / minutesPerDay,
 		cacheTTL:       defaultStatusCacheTTL,
 	}
 	if cfg.selector == "" {
@@ -194,6 +210,13 @@ func statusConfigFromEnv() statusConfig {
 			cfg.dayMissRatio = minutes / minutesPerDay
 		} else {
 			log.Printf("status: ignoring STATUS_DAY_MISS_MINUTES %q; want minutes in [0, %d)", raw, minutesPerDay)
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("STATUS_DAY_OUTAGE_MINUTES")); raw != "" {
+		if minutes, err := strconv.ParseFloat(raw, 64); err == nil && minutes >= 0 && minutes < minutesPerDay {
+			cfg.dayOutageRatio = minutes / minutesPerDay
+		} else {
+			log.Printf("status: ignoring STATUS_DAY_OUTAGE_MINUTES %q; want minutes in [0, %d)", raw, minutesPerDay)
 		}
 	}
 	if raw := strings.TrimSpace(os.Getenv("STATUS_DEGRADED_MS")); raw != "" {
@@ -424,6 +447,12 @@ func statusUptimeQuery(selector string, windows []string) string {
 // different event from the service being down, and the two must not be blended
 // into a single number that means neither.
 //
+// Whether those bad spells overlapped is a separate question that per-location
+// figures cannot answer -- two locations each missing 6% of a day may describe
+// one 6% outage or two disjoint ones -- so simultaneity is measured directly
+// with a subquery. That subquery is the expensive part of this endpoint; see
+// README.md for the recording rule that makes it cheap.
+//
 // The rest of the failure story is assembled from what blackbox already
 // exports: a status code of 0 means a probe never got an HTTP response at all
 // (DNS, TCP or TLS), and probe_failed_due_to_regex separates "responded, but
@@ -431,6 +460,12 @@ func statusUptimeQuery(selector string, windows []string) string {
 func statusHistoryQuery(selector string) string {
 	clauses := []string{
 		`label_replace(avg by (target, probe) (avg_over_time(probe_success{` + selector + `}[1d])), "agg", "location", "", "")`,
+		// Share of the day the target was reachable from at least one
+		// location. max by (target) collapses the locations at each instant,
+		// so averaging it over the day measures overlap rather than the sum of
+		// separate bad spells -- which per-location availability cannot do,
+		// however it is combined.
+		`label_replace(avg_over_time((max by (target) (probe_success{` + selector + `}))[1d:` + dayOutageResolution + `]), "agg", "reachable", "", "")`,
 		`label_replace(min by (target) (min_over_time(probe_http_status_code{` + selector + `}[1d])), "agg", "http_min", "", "")`,
 		`label_replace(max by (target) (max_over_time(probe_http_status_code{` + selector + `}[1d])), "agg", "http_max", "", "")`,
 		`label_replace(max by (target) (max_over_time(probe_failed_due_to_regex{` + selector + `}[1d])), "agg", "regex", "", "")`,
@@ -569,7 +604,7 @@ func buildStatusSnapshot(cfg statusConfig, current, uptime, history []promSeries
 		}
 	}
 	for entry, days := range histories {
-		entry.service.History = finalizeHistory(days, cfg.dayMissRatio)
+		entry.service.History = finalizeHistory(days, cfg)
 	}
 
 	snapshot := statusSnapshot{
@@ -611,7 +646,11 @@ func buildStatusSnapshot(cfg statusConfig, current, uptime, history []promSeries
 type historyDay struct {
 	// One availability figure per monitoring location, kept apart so a bad
 	// location cannot be averaged away by a good one.
-	locations     []float64
+	locations []float64
+	// Share of the day reachable from at least one location. Absent when the
+	// subquery returned nothing for this bucket.
+	reachable     float64
+	hasReachable  bool
 	httpMin       float64
 	httpMax       float64
 	hasHTTP       bool
@@ -625,6 +664,9 @@ func (d *historyDay) observe(agg string, value float64) {
 	case "location":
 		// One series per monitoring location.
 		d.locations = append(d.locations, value)
+	case "reachable":
+		d.reachable = value
+		d.hasReachable = true
 	case "http_min":
 		if !d.hasHTTP || value < d.httpMin {
 			d.httpMin = value
@@ -643,16 +685,20 @@ func (d *historyDay) observe(agg string, value float64) {
 
 // finalizeHistory converts accumulated buckets to the published strip.
 //
-// Each day is classified the same way the live state is, so a bar means what
-// the badge means: a location that missed more than dayMissRatio of the day
-// counts against it, one such location is warn, all of them is bad. Below that
-// threshold a day is clean -- a handful of failed scrapes over 24 hours is the
-// open internet, not an incident, and colouring the day for it was the same
-// false alarm the live rule exists to avoid.
+// Red is reserved for a confirmed outage: the target unreachable from every
+// location at once, for longer than dayOutageRatio. Locations having bad
+// spells at different times is not that -- the service was still answering
+// someone throughout -- so any number of locations missing checks, however
+// many, is amber while they never overlap.
+//
+// Amber means a location missed more than dayMissRatio of the day. Below that
+// a day is clean: a handful of failed scrapes over 24 hours is the open
+// internet, not an incident, and colouring the day for it was the same false
+// alarm the live rule exists to avoid.
 //
 // A day Prometheus has no data for stays nil so the page can render it as "no
 // data" rather than as an outage.
-func finalizeHistory(days []historyDay, dayMissRatio float64) []*statusHistoryDay {
+func finalizeHistory(days []historyDay, cfg statusConfig) []*statusHistoryDay {
 	out := make([]*statusHistoryDay, len(days))
 	for i := range days {
 		day := days[i]
@@ -665,9 +711,18 @@ func finalizeHistory(days []historyDay, dayMissRatio float64) []*statusHistoryDa
 		for _, availability := range day.locations {
 			best = math.Max(best, availability)
 			worst = math.Min(worst, availability)
-			if 1-availability > dayMissRatio {
+			if 1-availability > cfg.dayMissRatio {
 				affected++
 			}
+		}
+
+		// Time the target was reachable from nowhere at all. Only a confirmed
+		// overlap counts: if the subquery gave us nothing for this bucket we
+		// have no evidence of one, and inferring it from per-location figures
+		// would be the guess this measurement exists to replace.
+		outage := 0.0
+		if day.hasReachable {
+			outage = math.Max(0, 1-day.reachable)
 		}
 
 		published := &statusHistoryDay{
@@ -677,18 +732,21 @@ func finalizeHistory(days []historyDay, dayMissRatio float64) []*statusHistoryDa
 			LocationsTotal: len(day.locations),
 		}
 		switch {
-		case affected == 0:
-			published.State = statusOK
-		case affected < len(day.locations):
+		case outage > cfg.dayOutageRatio:
+			published.State = statusBad
+		case affected > 0:
 			published.State = statusWarn
 		default:
-			published.State = statusBad
+			published.State = statusOK
 		}
 
 		if published.State != statusOK {
 			published.WorstMissRate = math.Round((1-worst)*10000) / 10000
 			published.LocationsAffected = affected
 			published.ContentFailed = day.contentFailed
+			if published.State == statusBad {
+				published.OutageMinutes = math.Round(outage * minutesPerDay)
+			}
 			// A status code of 0 is blackbox reporting that a probe never got
 			// an HTTP response, which is a different story from a bad status.
 			published.NoResponse = day.hasHTTP && day.httpMin == 0
