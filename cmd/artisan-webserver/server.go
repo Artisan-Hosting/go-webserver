@@ -13,6 +13,8 @@ type serverConfig struct {
 	hub             *reloadHub
 	imageCache      *webpConversionCache
 	previewState    *previewState
+	status          statusConfig
+	statusCache     *statusCache
 }
 
 type serverDependencies struct {
@@ -20,6 +22,7 @@ type serverDependencies struct {
 	deliverMail   func(EmailPayload) error
 	previewClient *http.Client
 	fetchPreview  func(*http.Client, string) ([]byte, error)
+	promQuery     promQueryFunc
 	now           func() time.Time
 }
 
@@ -37,6 +40,12 @@ func newServerHandler(cfg serverConfig, deps serverDependencies) http.Handler {
 	}
 	if cfg.previewState == nil {
 		cfg.previewState = newPreviewState()
+	}
+	if cfg.statusCache == nil {
+		cfg.statusCache = newStatusCache()
+	}
+	if deps.promQuery == nil {
+		deps.promQuery = newPromQuery(&http.Client{Timeout: statusQueryTimeout}, cfg.status.promURL, cfg.status.bearer)
 	}
 	if deps.verifyCaptcha == nil {
 		deps.verifyCaptcha = verifyCaptcha
@@ -61,6 +70,7 @@ func newServerHandler(cfg serverConfig, deps serverDependencies) http.Handler {
 	mux.Handle("/", htmlPreviewRewriteHandler(cfg.staticDir, staticFiles, cfg.buildHash))
 	mux.HandleFunc("/api/contact", contactHandlerWithDependencies(cfg.simError, deps.verifyCaptcha, deps.deliverMail))
 	mux.HandleFunc("/api/captcha-config", captchaConfigHandler)
+	mux.HandleFunc("/api/status", statusHandlerWithDependencies(cfg.status, deps.promQuery, cfg.statusCache, deps.now))
 	mux.HandleFunc("/reload", reloadHandlerWithHub(cfg.hub))
 	return mux
 }

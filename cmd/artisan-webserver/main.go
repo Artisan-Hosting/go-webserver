@@ -13,6 +13,7 @@
 //   - email_templates.go  - HTML/plain-text email bodies
 //   - images.go           - on-the-fly WebP conversion for /imgs/
 //   - preview.go          - server-side link-preview fetching/caching
+//   - status.go           - the /api/status Prometheus-backed service status
 //   - watch.go            - filesystem watching and live-reload SSE
 package main
 
@@ -93,6 +94,13 @@ func run(ctx context.Context, args []string) error {
 	// Serve static files
 	hub := newReloadHub()
 	imageCache := newWebPConversionCache()
+	status := statusConfigFromEnv()
+	if status.enabled {
+		log.Printf("status: publishing %d services from %s", len(status.targets), status.promURL)
+	} else {
+		log.Print("status: /api/status disabled (set PROMETHEUS_URL and STATUS_SERVICES to enable)")
+	}
+
 	handler := newServerHandler(serverConfig{
 		staticDir:       staticDir,
 		previewCacheDir: previewCacheDir,
@@ -101,6 +109,7 @@ func run(ctx context.Context, args []string) error {
 		hub:             hub,
 		previewState:    previews,
 		imageCache:      imageCache,
+		status:          status,
 	}, serverDependencies{})
 	addr := fmt.Sprintf("0.0.0.0:%d", *port)
 	listener, err := net.Listen("tcp", addr)
