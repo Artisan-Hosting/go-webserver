@@ -55,7 +55,9 @@ func newServerHandler(cfg serverConfig, deps serverDependencies) http.Handler {
 		deps.deliverMail = sendMail
 	}
 	if deps.previewClient == nil {
-		deps.previewClient = &http.Client{Timeout: 12 * time.Second}
+		// Captures always run in the background now, so this budget covers a
+		// forced fresh render rather than a visitor's patience.
+		deps.previewClient = &http.Client{Timeout: previewWarmRequestTimeout}
 	}
 	if deps.probePreview == nil {
 		deps.probePreview = probePreviewTarget
@@ -67,11 +69,22 @@ func newServerHandler(cfg serverConfig, deps serverDependencies) http.Handler {
 		deps.now = time.Now
 	}
 
+	// A pending target's capture is kicked off by the very request that
+	// renders its placeholder, so it is already underway by the time the
+	// page asks whether it is ready.
+	renderMode := func(target string) previewRenderMode {
+		mode := cfg.previewState.renderMode(cfg.previewCacheDir, target)
+		if mode == previewRenderPending {
+			cfg.previewState.captureInBackground(deps.previewClient, deps.probePreview, deps.fetchPreview, cfg.previewCacheDir, target)
+		}
+		return mode
+	}
+
 	staticFiles := http.FileServer(http.Dir(cfg.staticDir))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/imgs/", optimizedImageHandlerWithCache(cfg.staticDir, staticFiles, cfg.imageCache))
 	mux.HandleFunc("/__preview/", previewImageHandlerWithStateDependencies(cfg.previewCacheDir, cfg.previewState.sourceByHash, deps.previewClient, deps.probePreview, deps.fetchPreview, deps.now, cfg.previewState))
-	mux.Handle("/", htmlPreviewRewriteHandler(cfg.staticDir, staticFiles, cfg.buildHash, cfg.previewState))
+	mux.Handle("/", htmlPreviewRewriteHandler(cfg.staticDir, staticFiles, cfg.buildHash, renderMode))
 	mux.HandleFunc("/api/contact", contactHandlerWithDependencies(cfg.simError, deps.verifyCaptcha, deps.deliverMail))
 	mux.HandleFunc("/api/captcha-config", captchaConfigHandler)
 	mux.HandleFunc("/api/status", statusHandlerWithDependencies(cfg.status, deps.promQuery, cfg.statusCache, deps.now))

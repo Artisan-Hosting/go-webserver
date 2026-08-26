@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -173,6 +175,20 @@ func TestPreviewMemoryAndDiskCaches(t *testing.T) {
 	}
 }
 
+// waitFor polls condition until it holds or the test gives up, for the
+// background captures the preview endpoints now start instead of blocking.
+func waitFor(t *testing.T, what string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
 func TestPreviewImageHandlerPaths(t *testing.T) {
 	resetPreviewState()
 	dir := t.TempDir()
@@ -183,11 +199,11 @@ func TestPreviewImageHandlerPaths(t *testing.T) {
 		}
 		return "", false
 	}
-	fetchCalls := 0
+	var fetchCalls atomic.Int64
 	handler := previewImageHandlerWithDependencies(dir, source, http.DefaultClient, nil, func(_ *http.Client, got string) ([]byte, error) {
-		fetchCalls++
+		fetchCalls.Add(1)
 		if got != target {
-			t.Fatalf("target=%q", got)
+			t.Errorf("target=%q", got)
 		}
 		return []byte("webp-data"), nil
 	}, func() time.Time { return time.Unix(1000, 0) })
@@ -208,27 +224,60 @@ func TestPreviewImageHandlerPaths(t *testing.T) {
 	}
 
 	request := httptest.NewRequest(http.MethodGet, "/__preview/1234567890abcdef.webp", nil)
-	recorder := httptest.NewRecorder()
-	handler(recorder, request)
-	if recorder.Code != http.StatusOK || recorder.Body.String() != "webp-data" || fetchCalls != 1 {
-		t.Fatalf("fetch response=%d %q calls=%d", recorder.Code, recorder.Body.String(), fetchCalls)
+	statusRequest := httptest.NewRequest(http.MethodGet, "/__preview/1234567890abcdef.json", nil)
+
+	// A miss answers immediately with the placeholder rather than holding the
+	// request open for the screenshot service, and starts the capture.
+	miss := httptest.NewRecorder()
+	handler(miss, request)
+	if miss.Code != http.StatusTemporaryRedirect || miss.Header().Get("Location") != previewPlaceholderLightSrc {
+		t.Fatalf("miss=%d %q", miss.Code, miss.Header().Get("Location"))
 	}
+	if miss.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("placeholder redirect is cacheable: %q", miss.Header().Get("Cache-Control"))
+	}
+
+	waitFor(t, "the background capture to land", func() bool {
+		_, cached := defaultPreviewState.cachedPreview(dir, target)
+		return cached
+	})
 	if _, err := os.Stat(filepath.Join(dir, previewObjectKey(target)+".webp")); err != nil {
-		t.Fatal("fetched preview not persisted")
+		t.Fatal("captured preview not persisted")
 	}
+
+	hit := httptest.NewRecorder()
+	handler(hit, request)
+	if hit.Code != http.StatusOK || hit.Body.String() != "webp-data" {
+		t.Fatalf("hit=%d %q", hit.Code, hit.Body.String())
+	}
+
+	ready := httptest.NewRecorder()
+	handler(ready, statusRequest)
+	if body := ready.Body.String(); !strings.Contains(body, `"state":"ready"`) ||
+		!strings.Contains(body, `"src":"/__preview/1234567890abcdef.webp"`) {
+		t.Fatalf("status=%s", body)
+	}
+	if ready.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("preview status is cacheable")
+	}
+
 	second := httptest.NewRecorder()
 	handler(second, request)
-	if fetchCalls != 1 {
+	if calls := fetchCalls.Load(); calls != 1 {
+		t.Fatalf("fetches=%d, want the capture reused from cache", calls)
+	}
+	if second.Body.String() != "webp-data" {
 		t.Fatal("memory cache missed")
 	}
 
 	resetPreviewState()
 	third := httptest.NewRecorder()
 	handler(third, request)
-	if fetchCalls != 1 || third.Body.String() != "webp-data" {
-		t.Fatal("disk cache missed")
+	if calls := fetchCalls.Load(); calls != 1 || third.Body.String() != "webp-data" {
+		t.Fatalf("disk cache missed: fetches=%d body=%q", calls, third.Body.String())
 	}
 
+	// A capture that fails leaves the target on the placeholder and says so.
 	resetPreviewState()
 	_ = os.Remove(filepath.Join(dir, previewObjectKey(target)+".webp"))
 	failing := previewImageHandlerWithDependencies(dir, source, http.DefaultClient, nil, func(*http.Client, string) ([]byte, error) {
@@ -239,11 +288,14 @@ func TestPreviewImageHandlerPaths(t *testing.T) {
 	if redirect.Code != http.StatusTemporaryRedirect || redirect.Header().Get("Location") != previewPlaceholderLightSrc {
 		t.Fatalf("redirect=%d %q", redirect.Code, redirect.Header().Get("Location"))
 	}
-	if redirect.Header().Get("Cache-Control") != "no-store" {
-		t.Fatalf("placeholder redirect is cacheable: %q", redirect.Header().Get("Cache-Control"))
-	}
-	if !defaultPreviewState.isUnavailable(target) {
-		t.Fatal("failed capture did not mark the target unavailable")
+	waitFor(t, "the failed capture to be recorded", func() bool {
+		return defaultPreviewState.isUnavailable(target)
+	})
+
+	unavailable := httptest.NewRecorder()
+	failing(unavailable, statusRequest)
+	if body := unavailable.Body.String(); !strings.Contains(body, `"state":"unavailable"`) {
+		t.Fatalf("status=%s", body)
 	}
 
 	darkRequest := httptest.NewRequest(http.MethodGet, "/__preview/1234567890abcdef.webp", nil)
@@ -257,20 +309,21 @@ func TestPreviewImageHandlerPaths(t *testing.T) {
 	// A target whose origin never answers 200 must not be screenshotted at
 	// all: the probe is what stops a 502 page becoming the preview.
 	resetPreviewState()
-	fetched := false
+	var fetched atomic.Bool
 	unhealthy := previewImageHandlerWithDependencies(dir, source, http.DefaultClient,
 		func(*http.Client, string) error { return errors.New("origin returned HTTP 502") },
 		func(*http.Client, string) ([]byte, error) {
-			fetched = true
+			fetched.Store(true)
 			return []byte("webp-data"), nil
 		}, time.Now)
 	probed := httptest.NewRecorder()
 	unhealthy(probed, request)
-	if fetched {
-		t.Fatal("captured a screenshot of an unhealthy origin")
-	}
 	if probed.Code != http.StatusTemporaryRedirect {
 		t.Fatalf("unhealthy origin status=%d", probed.Code)
+	}
+	waitFor(t, "the screening verdict", func() bool { return defaultPreviewState.isUnavailable(target) })
+	if fetched.Load() {
+		t.Fatal("captured a screenshot of an unhealthy origin")
 	}
 }
 
@@ -407,8 +460,8 @@ func TestPreviewImageIsBlankAndFetchRejectsIt(t *testing.T) {
 
 func TestRewriteSubstitutesPlaceholderForUnavailableTargets(t *testing.T) {
 	src := []byte(`<img src="/fallback.webp" alt="Preview of example" data-server-preview-url="https://example.com">`)
-	got := string(rewriteServerPreviewSources(src, "build", func(target string) bool {
-		return target == "https://example.com"
+	got := string(rewriteServerPreviewSources(src, "build", func(target string) previewRenderMode {
+		return previewRenderUnavailable
 	}))
 	for _, want := range []string{
 		`src="` + previewPlaceholderLightSrc + `"`,
@@ -424,7 +477,7 @@ func TestRewriteSubstitutesPlaceholderForUnavailableTargets(t *testing.T) {
 		t.Fatalf("unavailable target still points at the preview proxy: %s", got)
 	}
 
-	healthy := string(rewriteServerPreviewSources(src, "build", func(string) bool { return false }))
+	healthy := string(rewriteServerPreviewSources(src, "build", func(string) previewRenderMode { return previewRenderReady }))
 	if !strings.Contains(healthy, "/__preview/") || !strings.Contains(healthy, `data-preview-state="live"`) {
 		t.Fatalf("healthy rewrite=%s", healthy)
 	}
@@ -609,5 +662,67 @@ func TestPreviewErrorReferenceSurvivesAnUnreachableService(t *testing.T) {
 	errorCaptureReference.ensure(offline)
 	if errorCaptureReference.matches(0) {
 		t.Fatal("an unlearned reference must never match")
+	}
+}
+
+func TestRewriteDefersPendingPreviews(t *testing.T) {
+	src := []byte(`<img src="/fallback.webp" alt="Preview of example" data-server-preview-url="https://example.com">`)
+	got := string(rewriteServerPreviewSources(src, "build", func(string) previewRenderMode {
+		return previewRenderPending
+	}))
+	hash := previewCacheKey("https://example.com", "build")
+
+	// The tag must resolve from our own disk, not from the screenshot
+	// service, while carrying what the page needs to swap in the capture.
+	if !strings.Contains(got, `src="`+previewPlaceholderLightSrc+`"`) {
+		t.Fatalf("pending tag does not lead with the placeholder: %s", got)
+	}
+	for _, want := range []string{
+		`data-preview-state="placeholder"`,
+		`data-preview-src="/__preview/` + hash + `.webp"`,
+		`data-preview-status="/__preview/` + hash + `.json"`,
+		"data-theme-logo",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("pending tag missing %s: %s", want, got)
+		}
+	}
+
+	// An unavailable target gets no swap addresses: nothing is coming.
+	unavailable := string(rewriteServerPreviewSources(src, "build", func(string) previewRenderMode {
+		return previewRenderUnavailable
+	}))
+	if strings.Contains(unavailable, "data-preview-status") {
+		t.Fatalf("unavailable tag invites polling: %s", unavailable)
+	}
+}
+
+func TestPreviewCaptureEndpointsForceAFreshRender(t *testing.T) {
+	endpoints := previewCaptureEndpoints("https://example.com/page", "nonce123")
+	if len(endpoints) != 3 {
+		t.Fatalf("endpoints=%v", endpoints)
+	}
+	if strings.Contains(endpoints[0], "nonce123") || strings.Contains(endpoints[0], "wait/") {
+		t.Fatalf("the first attempt should be the service's cached capture: %s", endpoints[0])
+	}
+	retry := endpoints[1]
+	if !strings.Contains(retry, fmt.Sprintf("wait/%d/", previewRenderWaitSeconds)) {
+		t.Fatalf("the retry does not wait for the page to paint: %s", retry)
+	}
+	if !strings.HasSuffix(retry, "https://example.com/page?preview=nonce123") {
+		t.Fatalf("the retry is not cache-busted: %s", retry)
+	}
+	if !strings.Contains(endpoints[2], "ogImage") {
+		t.Fatalf("endpoints=%v", endpoints)
+	}
+
+	withQuery := previewCaptureEndpoints("https://example.com/page?a=1", "n")
+	if !strings.HasSuffix(withQuery[1], "?a=1&preview=n") {
+		t.Fatalf("existing query mishandled: %s", withQuery[1])
+	}
+
+	// The sentinel lookup wants the plain endpoints only.
+	if bare := previewCaptureEndpoints("https://example.com", ""); len(bare) != 2 {
+		t.Fatalf("bare=%v", bare)
 	}
 }
